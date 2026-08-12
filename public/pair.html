@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f1115" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <title>Pair with Switchboard</title>
+    <link rel="stylesheet" href="/app.css" />
+    <style>
+      body { display: flex; align-items: center; justify-content: center; min-height: 100dvh; padding: 24px; }
+      .pair { width: min(420px, 100%); display: grid; gap: 14px; }
+      .pair h1 { font-size: 18px; margin: 0; }
+      .pair input { font-family: var(--mono); font-size: 22px; text-align: center; letter-spacing: 0.12em; padding: 14px; }
+      .pair button { min-height: 50px; font-size: 16px; }
+      .result { font-size: 13px; padding: 11px 13px; border-radius: 6px; background: var(--panel-2); }
+      .result.bad { color: var(--bad); }
+      .result.good { color: var(--ok); }
+    </style>
+  </head>
+  <body>
+    <form class="pair" id="form">
+      <h1>Pair this device</h1>
+      <p class="hint">
+        Open Switchboard on the Mac Mini, go to Setup, and press <b>New pairing code</b>. Type it here.
+        The code is good for five minutes and works once.
+      </p>
+      <input id="code" placeholder="abc-def" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" />
+      <input id="name" placeholder="what to call this device" value="phone" />
+      <button type="submit">Pair</button>
+      <div id="result" class="result" hidden></div>
+    </form>
+
+    <script type="module">
+      // The token is returned exactly once and kept here. Everything else in the
+      // dashboard reads it from localStorage and sends it as a bearer token, so
+      // this device never needs the shared gateway secret.
+      const form = document.querySelector('#form');
+      const result = document.querySelector('#result');
+
+      const show = (text, ok) => {
+        result.hidden = false;
+        result.textContent = text;
+        result.className = `result ${ok ? 'good' : 'bad'}`;
+      };
+
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        const code = document.querySelector('#code').value.trim().toLowerCase();
+        const name = document.querySelector('#name').value.trim() || 'phone';
+        if (!code) return;
+        try {
+          const res = await fetch('/api/devices/claim', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ code, name }),
+          });
+          const body = await res.json();
+          if (!res.ok || body.error) return show(body.error ?? `pairing failed (${res.status})`, false);
+
+          localStorage.setItem('swb-token', body.token);
+          localStorage.setItem('swb-device-id', body.device.id);
+          show('Paired. Opening Switchboard…', true);
+          setTimeout(() => location.replace('/'), 900);
+        } catch (err) {
+          show(`could not reach the gateway: ${err.message}`, false);
+        }
+      };
+    </script>
+  </body>
+</html>

@@ -104,6 +104,77 @@ CREATE TABLE IF NOT EXISTS notify_log (
 );
 CREATE INDEX IF NOT EXISTS idx_notify_rule ON notify_log(rule, ts);
 
+CREATE TABLE IF NOT EXISTS skills (
+  name          TEXT PRIMARY KEY,
+  trust         TEXT NOT NULL DEFAULT 'sandboxed',  -- sandboxed|restricted|trusted
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  authored_by   TEXT,                                -- run id that wrote it
+  origin_task   TEXT,                                -- what the human actually asked for
+  manifest      TEXT NOT NULL DEFAULT '{}',
+  retired_at    TEXT,
+  runs          INTEGER NOT NULL DEFAULT 0,
+  successes     INTEGER NOT NULL DEFAULT 0,
+  failures      INTEGER NOT NULL DEFAULT 0,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_used_at  TEXT,
+  flagged       INTEGER NOT NULL DEFAULT 0,
+  flag_reason   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skills_trust ON skills(trust);
+
+CREATE TABLE IF NOT EXISTS skill_history (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  skill      TEXT NOT NULL,
+  ts         TEXT NOT NULL,
+  run_id     TEXT,
+  action     TEXT NOT NULL,      -- authored|edited|promoted|demoted|retired|restored
+  detail     TEXT,
+  diff       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skill_history ON skill_history(skill, id);
+
+CREATE TABLE IF NOT EXISTS skill_uses (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  skill     TEXT NOT NULL,
+  run_id    TEXT,
+  ts        TEXT NOT NULL,
+  ok        INTEGER NOT NULL,
+  ms        INTEGER,
+  error     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skill_uses ON skill_uses(skill, id);
+
+CREATE TABLE IF NOT EXISTS devices (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  token_hash  TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  last_seen_at TEXT,
+  user_agent  TEXT,
+  revoked_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_devices_hash ON devices(token_hash);
+
+CREATE TABLE IF NOT EXISTS pairings (
+  code        TEXT PRIMARY KEY,
+  created_at  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  claimed_at  TEXT,
+  device_id   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id          TEXT PRIMARY KEY,
+  device_id   TEXT,
+  endpoint    TEXT NOT NULL UNIQUE,
+  p256dh      TEXT NOT NULL,
+  auth        TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  last_ok_at  TEXT,
+  failures    INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS kv (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -112,7 +183,8 @@ CREATE TABLE IF NOT EXISTS kv (
 `;
 
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
-  // Future schema changes append here; version 1 is the base schema above.
+  // A run can be scoped to one skill, which pins it to that skill's manifest.
+  { version: 2, sql: `ALTER TABLE runs ADD COLUMN skill TEXT;` },
 ];
 
 export function openDb(path: string): Db {

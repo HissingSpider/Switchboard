@@ -4,8 +4,25 @@
 const $ = (sel) => document.querySelector(sel);
 const state = { runs: [], selected: null, events: [], projects: [], agents: [] };
 
-const api = async (path, init) => {
-  const res = await fetch(path, { headers: { 'content-type': 'application/json' }, ...init });
+/** A paired device holds its own token; on the Mac Mini itself there is none
+ *  and loopback is trusted. */
+const deviceToken = () => localStorage.getItem('swb-token');
+
+const api = async (path, init = {}) => {
+  const token = deviceToken();
+  const res = await fetch(path, {
+    ...init,
+    headers: {
+      'content-type': 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(init.headers ?? {}),
+    },
+  });
+  if (res.status === 401) {
+    // The token was revoked from the Setup tab; send this device back to pairing.
+    localStorage.removeItem('swb-token');
+    location.replace('/pair.html');
+  }
   if (!res.ok) throw new Error(`${path}: ${res.status}`);
   return res.json();
 };
@@ -21,7 +38,9 @@ for (const btn of document.querySelectorAll('nav button')) {
     if (btn.dataset.tab === 'history') loadHistory();
     if (btn.dataset.tab === 'board') loadBoard();
     if (btn.dataset.tab === 'cost') loadCost();
-    if (btn.dataset.tab === 'config') loadConfig();
+    if (btn.dataset.tab === 'inbox') loadInbox();
+    if (btn.dataset.tab === 'skills') loadSkills();
+    if (btn.dataset.tab === 'setup') loadSetup();
   };
 }
 
@@ -35,29 +54,16 @@ async function refreshStatus() {
 
 async function refreshConfirmations() {
   const { pending } = await api('/api/confirmations');
-  const box = $('#confirmations');
-  box.hidden = pending.length === 0;
-  box.innerHTML = pending
-    .map(
-      (c) => `<div class="confirm">
-        <code>${esc(c.id)}</code>
-        <span><b>${esc(c.runId)}</b> wants to <b>${esc(c.tool)}</b>: ${esc(c.detail.slice(0, 160))}</span>
-        <button data-approve="${c.id}">approve</button>
-        <button class="danger" data-deny="${c.id}">deny</button>
-      </div>`,
-    )
-    .join('');
-  for (const b of box.querySelectorAll('[data-approve]')) {
-    b.onclick = () => answer(b.dataset.approve, true);
-  }
-  for (const b of box.querySelectorAll('[data-deny]')) {
-    b.onclick = () => answer(b.dataset.deny, false);
-  }
+  const badge = $('#inbox-badge');
+  badge.hidden = pending.length === 0;
+  badge.textContent = String(pending.length);
+  if ($('#tab-inbox').classList.contains('active')) loadInbox();
 }
 
 async function answer(id, approve) {
   await api(`/api/confirmations/${id}`, { method: 'POST', body: JSON.stringify({ approve }) });
   await refreshConfirmations();
+  await loadInbox();
 }
 
 // ------------------------------------------------------------------- runs
@@ -110,10 +116,27 @@ function renderEvents() {
 }
 
 // ------------------------------------------------------------------- SSE
+// EventSource reconnects on its own and resends Last-Event-ID, so the server
+// can replay exactly what was missed. We track the id anyway for the manual
+// reconnect path, because a phone that was asleep often gets a clean close
+// rather than an error.
+let lastEventId = 0;
+
+function setOffline(off) {
+  $('#offline').hidden = !off;
+}
+
 function connect() {
-  const es = new EventSource('/events');
+  const token = deviceToken();
+  const params = new URLSearchParams();
+  if (lastEventId) params.set('since', String(lastEventId));
+  if (token) params.set('token', token);
+  const es = new EventSource(`/events${params.toString() ? `?${params}` : ''}`);
+  es.onopen = () => setOffline(false);
   es.onmessage = (msg) => {
+    if (msg.lastEventId) lastEventId = Number(msg.lastEventId);
     const ev = JSON.parse(msg.data);
+    if (ev.id > lastEventId) lastEventId = ev.id;
     if (ev.runId && ev.runId === state.selected) {
       state.events.push(ev);
       renderEvents();
@@ -124,8 +147,21 @@ function connect() {
     }
     if (ev.kind.startsWith('action.')) refreshConfirmations();
   };
-  es.onerror = () => setTimeout(() => es.readyState === 2 && connect(), 3000);
+  es.onerror = () => {
+    setOffline(true);
+    setTimeout(() => {
+      if (es.readyState === 2) connect();
+    }, 3000);
+  };
 }
+
+// Coming back from the lock screen is the common case, and neither `onerror`
+// nor `onopen` necessarily fires — so ask for the gap explicitly.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  refreshStatus().catch(() => setOffline(true));
+  refreshRuns().catch(() => undefined);
+});
 
 // ---------------------------------------------------------------- submit
 $('#submit').onsubmit = async (e) => {
@@ -280,3 +316,212 @@ async function init() {
 }
 
 init().catch((err) => ($('#summary').textContent = `error: ${err.message}`));
+
+// ----------------------------------------------------------------- inbox
+
+async function loadInbox() {
+  const { pending, audit } = await api('/api/confirmations');
+  $('#inbox').innerHTML = pending.length
+    ? pending
+        .map(
+          (c) => `<div class="approval">
+            <div class="what"><b>${esc(c.runId)}</b> wants to <b>${esc(c.tool)}</b></div>
+            <div class="detail">${esc(c.detail)}</div>
+            <div class="row">
+              <button data-approve="${c.id}">Approve</button>
+              <button class="danger" data-deny="${c.id}">Deny</button>
+              <span class="sub">${esc(c.id)} · asked ${ago(c.createdAt)}</span>
+            </div>
+          </div>`,
+        )
+        .join('')
+    : '<p class="hint">Nothing waiting.</p>';
+
+  for (const b of $('#inbox').querySelectorAll('[data-approve]')) b.onclick = () => answer(b.dataset.approve, true);
+  for (const b of $('#inbox').querySelectorAll('[data-deny]')) b.onclick = () => answer(b.dataset.deny, false);
+
+  $('#inbox-audit').innerHTML = audit
+    .filter((c) => c.status !== 'pending')
+    .slice(0, 25)
+    .map(
+      (c) => `<div class="answered">
+        <span class="st-${c.status}">${esc(c.status)}</span>
+        <span>${esc(c.tool)}</span>
+        <span class="dim">${esc(c.detail.slice(0, 70))}</span>
+        <span class="dim">${c.answeredBy ? esc(c.answeredBy) : 'no reply'}</span>
+      </div>`,
+    )
+    .join('');
+}
+
+function ago(iso) {
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+// ---------------------------------------------------------------- skills
+
+async function loadSkills() {
+  const [{ queue, stale }, all] = await Promise.all([api('/api/skills/review'), api('/api/skills')]);
+  const badge = $('#skills-badge');
+  const needsMe = queue.filter((s) => s.flagged || s.proposal);
+  badge.hidden = needsMe.length === 0;
+  badge.textContent = String(needsMe.length);
+
+  $('#skills-review').innerHTML = queue.length
+    ? queue.map(skillCard).join('')
+    : '<p class="hint">Nothing needs review.</p>';
+
+  const byName = new Map(all.skills.map((s) => [s.name, s]));
+  $('#skills-all').innerHTML =
+    all.skills
+      .map((s) => {
+        const rec = queue.find((q) => q.name === s.name);
+        return `<div class="skill">
+          <h4>${esc(s.name)} ${rec ? tierPill(rec.trust) : ''}</h4>
+          <div class="desc">${esc(s.description)}</div>
+        </div>`;
+      })
+      .join('') || '<p class="hint">No skills yet.</p>';
+  void byName;
+  void stale;
+  wireSkillButtons();
+}
+
+const tierPill = (t) => `<span class="tier tier-${t}">${t}</span>`;
+
+function skillCard(s) {
+  const rate = s.successRate === undefined ? 'never used' : `${Math.round(s.successRate * 100)}% over ${s.runs}`;
+  return `<div class="skill ${s.flagged ? 'flagged' : ''}">
+    <h4>${esc(s.name)} ${tierPill(s.trust)} ${s.flagged ? '<span class="tier tier-sandboxed">flagged</span>' : ''}</h4>
+    <div class="meta">${rate}${s.lastUsedAt ? ` · last used ${ago(s.lastUsedAt)}` : ''}${s.authoredBy ? ` · written by ${esc(s.authoredBy)}` : ' · hand-written'}</div>
+    ${s.originTask ? `<div class="desc">for: ${esc(s.originTask)}</div>` : ''}
+    ${s.flagReason ? `<div class="desc">flagged: ${esc(s.flagReason)}</div>` : ''}
+    ${s.proposal ? `<div class="proposal">${esc(s.proposal)}</div>` : ''}
+    <div class="row">
+      ${s.proposal ? `<button data-trust="${s.name}">Grant trusted</button>` : ''}
+      ${s.flagged ? `<button data-unflag="${s.name}">Clear flag</button>` : ''}
+      ${s.retiredAt ? `<button data-restore="${s.name}">Restore</button>` : `<button class="danger" data-retire="${s.name}">Retire</button>`}
+    </div>
+  </div>`;
+}
+
+function wireSkillButtons() {
+  const act = async (name, path, body) => {
+    await api(`/api/skills/${name}${path}`, { method: 'POST', body: JSON.stringify(body ?? {}) });
+    await loadSkills();
+  };
+  for (const b of document.querySelectorAll('[data-trust]')) b.onclick = () => act(b.dataset.trust, '/trust', { trust: 'trusted' });
+  for (const b of document.querySelectorAll('[data-unflag]')) b.onclick = () => act(b.dataset.unflag, '/unflag');
+  for (const b of document.querySelectorAll('[data-retire]')) b.onclick = () => act(b.dataset.retire, '/retire', { reason: 'retired from the dashboard' });
+  for (const b of document.querySelectorAll('[data-restore]')) b.onclick = () => act(b.dataset.restore, '/restore');
+}
+
+// ----------------------------------------------------------------- setup
+
+async function loadSetup() {
+  await loadConfig();
+  await refreshPushState();
+  await refreshDevices();
+  const r = await api('/api/reachability');
+  $('#reach').textContent = [
+    `tailscale: ${r.tailscale.installed ? (r.tailscale.running ? `running as ${r.tailscale.hostname ?? r.tailscale.ip}` : 'installed, not running') : 'not installed'}`,
+    ...r.urls.map((u) => `  ${u}`),
+    ...r.problems.map((p) => `! ${p}`),
+    ...r.advice.map((a) => `→ ${a}`),
+  ].join('\n');
+}
+
+async function refreshDevices() {
+  const { devices } = await api('/api/devices');
+  $('#devices').innerHTML =
+    devices
+      .map(
+        (d) => `<div class="device">
+          <div>
+            <div>${esc(d.name)}${d.revokedAt ? ' (revoked)' : ''}</div>
+            <div class="sub">${esc(d.id)} · ${d.lastSeenAt ? `seen ${ago(d.lastSeenAt)}` : 'never seen'}</div>
+          </div>
+          ${d.revokedAt ? '' : `<button class="danger" data-revoke="${d.id}">Revoke</button>`}
+        </div>`,
+      )
+      .join('') || '<p class="hint">No paired devices.</p>';
+  for (const b of $('#devices').querySelectorAll('[data-revoke]')) {
+    b.onclick = async () => {
+      await api(`/api/devices/${b.dataset.revoke}`, { method: 'DELETE' });
+      await refreshDevices();
+    };
+  }
+}
+
+$('#new-pair').onclick = async () => {
+  const { code, expiresAt } = await api('/api/devices/pair', { method: 'POST' });
+  $('#pair-code').textContent = code;
+  $('#pair-code').title = `expires ${new Date(expiresAt).toLocaleTimeString()}`;
+};
+
+// ------------------------------------------------------------------ push
+
+async function refreshPushState() {
+  const el = $('#push-state');
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    el.textContent = 'This browser cannot receive push notifications.';
+    return;
+  }
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = await reg?.pushManager.getSubscription();
+  el.textContent = sub
+    ? 'Notifications are on for this device.'
+    : standalone
+      ? 'Notifications are off.'
+      : 'Notifications are off. On iPhone, add to the Home Screen first.';
+}
+
+$('#enable-push').onclick = async () => {
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      $('#push-state').textContent = `Permission ${permission}.`;
+      return;
+    }
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api('/api/push/key');
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+    const json = sub.toJSON();
+    await api('/api/push/subscribe', {
+      method: 'POST',
+      body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys, deviceId: localStorage.getItem('swb-device-id') }),
+    });
+    await refreshPushState();
+  } catch (err) {
+    $('#push-state').textContent = `Could not enable: ${err.message}`;
+  }
+};
+
+$('#test-push').onclick = async () => {
+  const r = await api('/api/push/test', { method: 'POST' });
+  $('#push-state').textContent = `Sent to ${r.sent} device(s)${r.failed ? `, ${r.failed} failed` : ''}.`;
+};
+
+function urlBase64ToUint8Array(base64) {
+  const padded = (base64 + '='.repeat((4 - (base64.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(padded);
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => undefined);
+}
+
+// Deep link from a notification: /?tab=inbox or /?confirm=c-xxxx
+const params = new URLSearchParams(location.search);
+if (params.get('tab') || params.get('confirm')) {
+  const target = params.get('confirm') ? 'inbox' : params.get('tab');
+  document.querySelector(`nav button[data-tab="${target}"]`)?.click();
+}

@@ -9,6 +9,7 @@ import { checkPolicyIntegrity } from '../policy/policy.js';
 import { isRepo } from '../runner/git.js';
 import { SkillRegistry } from '../skills/loader.js';
 import { parseCron } from '../scheduler/cron.js';
+import { checkReachability } from '../net/reachability.js';
 import { WhisperCppStt, WHISPER_INSTALL_HELP } from '../voice/stt.js';
 import { pickTts, TTS_INSTALL_HELP } from '../voice/tts.js';
 import { WakeWordDetector, WAKE_WORD_HELP } from '../voice/wakeword.js';
@@ -272,6 +273,15 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
   } else {
     add({ name: 'voice', status: 'warn', detail: 'voice disabled in config' });
   }
+
+  // --- reachability ---------------------------------------------------
+  const reach = await checkReachability(cfg.gateway);
+  add({
+    name: 'reachability',
+    status: reach.problems.length ? 'warn' : 'ok',
+    detail: reach.urls.length ? `reachable at ${reach.urls[0]}` : 'loopback only',
+    fix: reach.problems.length ? `${reach.problems.join('; ')}\n      ${reach.advice.join('\n      ')}` : undefined,
+  });
 
   // --- caps -----------------------------------------------------------
   if (cfg.caps.maxCostUsd > 20) {

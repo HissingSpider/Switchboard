@@ -1,5 +1,6 @@
 import './core/warnings.js';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { loadConfig, ConfigError, type LoadedConfig } from './config/load.js';
 import { configureLogger, logger } from './core/logger.js';
 import { openDb, kvSet, kvGet } from './store/db.js';
@@ -21,6 +22,12 @@ import { TelegramAdapter } from './adapters/telegram.js';
 import { NotificationService } from './adapters/notify.js';
 import { Scheduler } from './scheduler/heartbeat.js';
 import { VoiceServer } from './voice/transport.js';
+import { DeviceStore } from './gateway/devices.js';
+import { PushService } from './gateway/push.js';
+import { SkillStore } from './store/skills.js';
+import { detectGap, shouldAuthor, authorAndRetry, reconcileManifest } from './skills/authoring.js';
+import { considerPromotion } from './skills/trust.js';
+import { parseManifest } from './skills/manifest.js';
 import type { ChannelAdapter } from './adapters/types.js';
 
 const log = logger('switchboard');
@@ -90,6 +97,51 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   const agents = new AgentRegistry(cfg, join(cfg.resolved.dataDir, 'agents'));
   agents.watchForChanges();
   const skills = new SkillRegistry(cfg.resolved.skillsDir);
+  const skillStore = new SkillStore(db);
+  const devices = new DeviceStore(db);
+  const push = new PushService(db, events);
+
+  // Every skill on disk gets a row, so manifests and trust are tracked even for
+  // the ones a human wrote by hand.
+  for (const skill of skills.all()) {
+    const existing = skillStore.get(skill.name);
+    const manifest = parseManifest(readFileSync(skill.file, 'utf8'));
+    if (!existing) skillStore.register({ name: skill.name, manifest, trust: 'restricted' });
+    else reconcileManifest(skillStore, cfg.resolved.skillsDir, skill.name, null);
+  }
+
+  /**
+   * When a run finishes, three things happen that the run itself can't do:
+   * its skill's record is updated, a capability gap it hit becomes a new skill,
+   * and a skill that has earned it moves up a trust tier.
+   */
+  registry.on('finished', (rec) => {
+    if (rec.skill) {
+      skillStore.recordUse(rec.skill, rec.status === 'done', { runId: rec.id, error: rec.error ?? undefined });
+      const outcome = considerPromotion(skillStore, rec.skill);
+      if (outcome.kind !== 'held') {
+        events.append({
+          runId: rec.id,
+          kind: 'system.start',
+          source: 'skills',
+          summary:
+            outcome.kind === 'promoted'
+              ? `"${rec.skill}" promoted to ${outcome.to} — ${outcome.reason}`
+              : `"${rec.skill}" is ready for ${outcome.to} — needs your approval (${outcome.reason})`,
+          data: { skill: rec.skill, outcome },
+        });
+      }
+    }
+
+    // Only real work is worth writing a tool for; an authoring run that hits a
+    // gap must not recurse into authoring another skill.
+    if (rec.status !== 'done' || rec.skill || rec.threadId?.startsWith('skill-authoring:')) return;
+    const gap = detectGap(rec.result ?? '', rec.prompt);
+    if (!gap || !shouldAuthor(gap)) return;
+    void authorAndRetry({ cfg, registry, runs, events, skills, store: skillStore }, gap, rec).catch((err: Error) =>
+      log.warn('skill authoring failed', { err: err.message }),
+    );
+  });
 
   // --- channels --------------------------------------------------------
   const attachmentDir = join(cfg.resolved.dataDir, 'attachments');
@@ -163,6 +215,9 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
     imessage,
     scheduler,
     voice,
+    devices,
+    push,
+    skillStore,
     token,
     hookToken: hookTok,
   });

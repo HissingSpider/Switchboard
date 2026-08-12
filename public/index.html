@@ -2,7 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f1115" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Switchboard" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" href="/icon-192.png" />
     <title>Switchboard</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
@@ -12,14 +19,16 @@
       <div id="summary" class="summary">connecting…</div>
       <nav>
         <button data-tab="live" class="active">Live</button>
+        <button data-tab="inbox">Inbox<span id="inbox-badge" class="badge" hidden>0</span></button>
         <button data-tab="history">History</button>
+        <button data-tab="skills">Skills<span id="skills-badge" class="badge" hidden>0</span></button>
         <button data-tab="board">Board</button>
         <button data-tab="cost">Cost</button>
-        <button data-tab="config">Config</button>
+        <button data-tab="setup">Setup</button>
       </nav>
     </header>
 
-    <div id="confirmations" class="confirmations" hidden></div>
+    <div id="offline" class="offline" hidden>offline — reconnecting</div>
 
     <main>
       <!-- LIVE ------------------------------------------------------- -->
@@ -36,6 +45,7 @@
               <option value="computer-use">computer-use</option>
             </select>
             <button type="submit">Run</button>
+            <a class="linkbtn" href="/voice.html">Voice</a>
           </div>
         </form>
 
@@ -53,6 +63,14 @@
         </div>
       </section>
 
+      <!-- INBOX ------------------------------------------------------ -->
+      <section id="tab-inbox" class="tab">
+        <p class="hint">Anything waiting on you. Approvals time out and abort — silence is never consent.</p>
+        <div id="inbox"></div>
+        <h3 class="section">Recently answered</h3>
+        <div id="inbox-audit"></div>
+      </section>
+
       <!-- HISTORY ---------------------------------------------------- -->
       <section id="tab-history" class="tab">
         <div class="row">
@@ -66,7 +84,18 @@
           </select>
           <select id="filter-project"><option value="">any project</option></select>
         </div>
-        <table id="history"></table>
+        <div class="scrollx"><table id="history"></table></div>
+      </section>
+
+      <!-- SKILLS ----------------------------------------------------- -->
+      <section id="tab-skills" class="tab">
+        <p class="hint">
+          Skills the machine wrote for itself start sandboxed and earn their way up. Only you can grant
+          <b>trusted</b> — the tier that may ask to send, publish, push or delete.
+        </p>
+        <div id="skills-review"></div>
+        <h3 class="section">All skills</h3>
+        <div id="skills-all"></div>
       </section>
 
       <!-- BOARD ------------------------------------------------------ -->
@@ -79,17 +108,42 @@
         <div id="cost"></div>
       </section>
 
-      <!-- CONFIG ----------------------------------------------------- -->
-      <section id="tab-config" class="tab">
+      <!-- SETUP ------------------------------------------------------ -->
+      <section id="tab-setup" class="tab">
+        <div class="board">
+          <div class="col">
+            <h3>This device</h3>
+            <div id="push-state" class="card">checking…</div>
+            <div class="row">
+              <button id="enable-push">Enable notifications</button>
+              <button id="test-push">Send a test</button>
+            </div>
+            <p class="hint">
+              On iPhone this only works once Switchboard is added to the Home Screen — Share → Add to Home Screen,
+              then open it from the icon.
+            </p>
+          </div>
+          <div class="col">
+            <h3>Pair a device</h3>
+            <div id="pair-code" class="card">—</div>
+            <div class="row"><button id="new-pair">New pairing code</button></div>
+            <p class="hint">On the new device open <code>/pair.html</code> and type the code. Codes last 5 minutes.</p>
+          </div>
+          <div class="col">
+            <h3>Paired devices</h3>
+            <div id="devices"></div>
+          </div>
+          <div class="col">
+            <h3>Reachability</h3>
+            <div id="reach" class="card">checking…</div>
+          </div>
+        </div>
         <div id="config"></div>
       </section>
     </main>
 
-    <!-- DIFF ------------------------------------------------------- -->
     <dialog id="diffbox">
-      <header>
-        <strong id="difftitle">diff</strong><button id="diffclose">close</button>
-      </header>
+      <header><strong id="difftitle">diff</strong><button id="diffclose">close</button></header>
       <pre id="diff"></pre>
     </dialog>
 

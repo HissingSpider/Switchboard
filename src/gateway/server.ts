@@ -6,9 +6,10 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { LoadedConfig } from '../config/load.js';
 import { profileFor } from '../config/load.js';
 import { logger } from '../core/logger.js';
-import { authorize, isLoopback } from './auth.js';
+import { authorize, isLoopback, bearerFrom } from './auth.js';
 import { HOOK_PATH } from '../runner/hook.js';
 import { decide } from '../policy/policy.js';
+import { applySandbox, type SandboxContext } from '../skills/sandbox.js';
 import { argLine } from '../policy/match.js';
 import type { RunRegistry } from '../runner/registry.js';
 import type { RunStore } from '../store/runs.js';
@@ -24,6 +25,11 @@ import type { Scheduler } from '../scheduler/heartbeat.js';
 import { children } from '../agents/handoff.js';
 import type { VoiceServer } from '../voice/transport.js';
 import { VOICE_PATH } from '../voice/transport.js';
+import type { DeviceStore } from './devices.js';
+import type { PushService } from './push.js';
+import type { SkillStore } from '../store/skills.js';
+import { considerPromotion, grantTrusted, proposeTrusted } from '../skills/trust.js';
+import { checkReachability, serveCommand } from '../net/reachability.js';
 
 const log = logger('gateway');
 
@@ -35,6 +41,7 @@ const MIME: Record<string, string> = {
   '.json': 'application/json',
   '.png': 'image/png',
   '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json',
 };
 
 export interface GatewayDeps {
@@ -51,6 +58,9 @@ export interface GatewayDeps {
   imessage?: ImessageAdapter;
   scheduler?: Scheduler;
   voice?: VoiceServer;
+  devices: DeviceStore;
+  push: PushService;
+  skillStore: SkillStore;
   token: string;
   hookToken: string;
 }
@@ -81,11 +91,7 @@ export class Gateway {
     this.voiceWss = new WebSocketServer({ noServer: true });
 
     this.server.on('upgrade', (req, socket, head) => {
-      const auth = authorize(req, {
-        token: this.d.token,
-        trustedHosts: cfg.gateway.trustedHosts ?? [],
-        allowLoopbackWithoutToken: true,
-      });
+      const auth = this.authorizeRequest(req);
       if (!auth.ok) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
@@ -135,15 +141,51 @@ export class Gateway {
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
   }
 
+  /**
+   * A device token is as good as the shared token. Loopback gets in without
+   * either — that is the machine the daemon runs on.
+   *
+   * The exception that matters: a request that *presents* a credential is judged
+   * on that credential alone, even from loopback. Under `tailscale serve` every
+   * proxied request arrives from 127.0.0.1, so falling back to loopback trust
+   * would let a revoked phone straight back in.
+   */
+  private authorizeRequest(req: IncomingMessage): { ok: true; device?: string } | { ok: false; status: number; message: string } {
+    // `bearerFrom` also reads ?token=, because EventSource cannot set headers.
+    const presented = bearerFrom(req);
+    const base = authorize(req, {
+      token: this.d.token,
+      trustedHosts: this.d.cfg.gateway.trustedHosts ?? [],
+      allowLoopbackWithoutToken: !presented,
+    });
+    if (base.ok) return { ok: true };
+    // The Host check is not something a device token can override.
+    if (base.status === 403) return base;
+    const device = presented ? this.d.devices.authenticate(presented) : undefined;
+    if (device) return { ok: true, device: device.id };
+    return { ok: false, status: 401, message: presented ? 'that token is not valid' : base.message };
+  }
+
   private onSocket(ws: WebSocket, req: IncomingMessage): void {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const runId = url.searchParams.get('run') ?? undefined;
-    const backlog = this.d.events.tail(200, runId);
-    ws.send(JSON.stringify({ type: 'backlog', events: backlog }));
+    const since = Number(url.searchParams.get('since') ?? 0);
+
+    // A client that was offline reconnects with the last id it saw and gets
+    // exactly what it missed. Without this a dropped connection silently loses
+    // events, and the dashboard shows a run that never appears to finish.
+    const backlog = since > 0 ? this.d.events.replay({ runId, sinceId: since, limit: 2000 }) : this.d.events.tail(200, runId);
+    ws.send(JSON.stringify({ type: 'backlog', events: backlog, resumed: since > 0, lastId: this.d.events.lastId() }));
+
     ws.on('message', (raw) => {
       try {
-        const msg = JSON.parse(String(raw)) as { type: string; [k: string]: unknown };
-        if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong' }));
+        const msg = JSON.parse(String(raw)) as { type: string; since?: number; run?: string };
+        if (msg.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong', lastId: this.d.events.lastId() }));
+        } else if (msg.type === 'resume') {
+          const missed = this.d.events.replay({ runId: msg.run ?? runId, sinceId: Number(msg.since ?? 0), limit: 2000 });
+          ws.send(JSON.stringify({ type: 'backlog', events: missed, resumed: true, lastId: this.d.events.lastId() }));
+        }
       } catch {
         /* ignore malformed frames */
       }
@@ -164,11 +206,7 @@ export class Gateway {
       }
       if (path.startsWith('/hooks/trigger/') && req.method === 'POST') return await this.handleTrigger(req, res, path);
 
-      const auth = authorize(req, {
-        token: this.d.token,
-        trustedHosts: this.d.cfg.gateway.trustedHosts ?? [],
-        allowLoopbackWithoutToken: true,
-      });
+      const auth = this.authorizeRequest(req);
       if (!auth.ok) return json(res, auth.status, { error: auth.message });
 
       if (path.startsWith('/api/')) return await this.api(req, res, url);
@@ -304,6 +342,115 @@ export class Gateway {
         byProject: runs.spendByProject(since),
       });
     }
+    // ---------------------------------------------------------- devices
+    if (p === '/devices' && method === 'GET') {
+      return json(res, 200, { devices: this.d.devices.list(true), pending: this.d.devices.pendingPairings() });
+    }
+    if (p === '/devices/pair' && method === 'POST') {
+      // Only a client that is already trusted may mint a pairing code.
+      return json(res, 201, this.d.devices.createPairingCode());
+    }
+    if (p === '/devices/claim' && method === 'POST') {
+      const body = (await readJson(req)) as { code?: string; name?: string };
+      if (!body.code) return json(res, 400, { error: 'code is required' });
+      const result = this.d.devices.claim(body.code, body.name ?? 'phone', String(req.headers['user-agent'] ?? ''));
+      if ('error' in result) return json(res, 400, result);
+      this.d.events.append({
+        runId: null,
+        kind: 'system.start',
+        source: 'gateway',
+        summary: `paired device "${result.device.name}" (${result.device.id})`,
+        data: { deviceId: result.device.id },
+      });
+      return json(res, 201, result);
+    }
+    const deviceMatch = /^\/devices\/([^/]+)$/.exec(p);
+    if (deviceMatch && method === 'DELETE') {
+      return json(res, 200, { revoked: this.d.devices.revoke(deviceMatch[1]!) });
+    }
+
+    // ------------------------------------------------------------- push
+    if (p === '/push/key') {
+      return json(res, 200, { publicKey: this.d.push.publicKey });
+    }
+    if (p === '/push/subscribe' && method === 'POST') {
+      const body = (await readJson(req)) as { endpoint?: string; keys?: { p256dh: string; auth: string }; deviceId?: string };
+      if (!body.endpoint || !body.keys?.p256dh || !body.keys.auth) return json(res, 400, { error: 'endpoint and keys are required' });
+      const sub = this.d.push.subscribe({ endpoint: body.endpoint, keys: body.keys, deviceId: body.deviceId ?? null });
+      return json(res, 201, { subscription: { id: sub.id, createdAt: sub.createdAt } });
+    }
+    if (p === '/push/unsubscribe' && method === 'POST') {
+      const body = (await readJson(req)) as { endpoint?: string };
+      return json(res, 200, { removed: body.endpoint ? this.d.push.unsubscribe(body.endpoint) : false });
+    }
+    if (p === '/push/test' && method === 'POST') {
+      const result = await this.d.push.send({ title: 'Switchboard', body: 'Push is working.', tag: 'test' });
+      return json(res, 200, result);
+    }
+    if (p === '/push' && method === 'GET') {
+      return json(res, 200, { subscriptions: this.d.push.list().map((sub) => ({ id: sub.id, deviceId: sub.deviceId, createdAt: sub.createdAt, lastOkAt: sub.lastOkAt, failures: sub.failures, host: safeHost(sub.endpoint) })) });
+    }
+
+    // ----------------------------------------------------------- skills
+    if (p === '/skills/review') {
+      const queue = this.d.skillStore.reviewQueue().map((skill) => ({
+        ...skill,
+        successRate: this.d.skillStore.successRate(skill.name),
+        proposal: skill.trust === 'restricted' ? proposeTrusted(skill) : undefined,
+      }));
+      return json(res, 200, { queue, stale: this.d.skillStore.stale() });
+    }
+    const skillMatch = /^\/skills\/([^/]+)(\/.*)?$/.exec(p);
+    if (skillMatch && skillMatch[1] !== 'review') {
+      const name = skillMatch[1]!;
+      const sub = skillMatch[2] ?? '';
+      const record = this.d.skillStore.get(name);
+      if (!record) return json(res, 404, { error: 'no such skill' });
+
+      if (sub === '' && method === 'GET') {
+        return json(res, 200, {
+          skill: record,
+          successRate: this.d.skillStore.successRate(name),
+          history: this.d.skillStore.history(name),
+          uses: this.d.skillStore.recentUses(name),
+          body: skills.get(name)?.body,
+        });
+      }
+      if (sub === '/trust' && method === 'POST') {
+        const body = (await readJson(req)) as { trust?: string };
+        if (body.trust === 'trusted') {
+          const updated = grantTrusted(this.d.skillStore, name, 'owner (dashboard)');
+          return json(res, 200, { skill: updated });
+        }
+        if (body.trust === 'sandboxed' || body.trust === 'restricted') {
+          return json(res, 200, { skill: this.d.skillStore.setTrust(name, body.trust, 'owner (dashboard)') });
+        }
+        return json(res, 400, { error: 'trust must be sandboxed, restricted or trusted' });
+      }
+      if (sub === '/promote' && method === 'POST') {
+        return json(res, 200, considerPromotion(this.d.skillStore, name));
+      }
+      if (sub === '/retire' && method === 'POST') {
+        const body = (await readJson(req)) as { reason?: string };
+        this.d.skillStore.retire(name, body.reason ?? 'retired from the dashboard');
+        return json(res, 200, { retired: true });
+      }
+      if (sub === '/restore' && method === 'POST') {
+        this.d.skillStore.restore(name);
+        return json(res, 200, { restored: true });
+      }
+      if (sub === '/unflag' && method === 'POST') {
+        this.d.skillStore.unflag(name);
+        return json(res, 200, { unflagged: true });
+      }
+    }
+
+    // ---------------------------------------------------- reachability
+    if (p === '/reachability') {
+      const report = await checkReachability(cfg.gateway);
+      return json(res, 200, { ...report, serveCommand: serveCommand(cfg.gateway.port) });
+    }
+
     if (p === '/voice') {
       return json(res, 200, { ...(this.d.voice?.status() ?? { enabled: false }), latency: this.d.voice?.latency() ?? [] });
     }
@@ -351,22 +498,34 @@ export class Gateway {
 
     const profile = profileFor(this.d.cfg, active?.permissionProfile);
     const call = { tool, input };
-    const verdict = decide(call, {
+    const workdir = active?.workdir ?? rec.projectPath ?? undefined;
+    let verdict = decide(call, {
       profile,
-      workdir: active?.workdir ?? rec.projectPath ?? undefined,
+      workdir,
       extraWritable: [this.d.cfg.resolved.scratchDir, this.d.cfg.resolved.artifactsDir],
     });
+
+    // A run pinned to a skill is additionally confined to that skill's declared
+    // capabilities. The manifest can only ever narrow the profile's answer.
+    const sandbox = this.sandboxFor(rec.skill, workdir);
+    verdict = applySandbox(verdict, call, sandbox);
 
     this.d.events.append({
       runId,
       kind: 'action.gated',
       source: 'policy',
       summary: `${verdict.tier} ${tool}: ${truncate(argLine(call), 140)} (${verdict.reason})`,
-      data: { tool, input, tier: verdict.tier, rule: verdict.rule, reason: verdict.reason },
+      data: { tool, input, tier: verdict.tier, rule: verdict.rule, reason: verdict.reason, skill: rec.skill ?? undefined },
     });
 
     if (verdict.tier === 'allow') return json(res, 200, { decision: 'allow', reason: verdict.reason });
     if (verdict.tier === 'deny') return json(res, 200, { decision: 'deny', reason: verdict.reason });
+
+    // A confirmation is the one thing worth waking someone for, so it goes out
+    // as a push as well as through the usual notification rules.
+    void this.d.push
+      .sendApprovalRequest(`pending-${runId}`, runId, tool, argLine(call))
+      .catch(() => undefined);
 
     const outcome = await this.d.confirms.request({
       runId,
@@ -380,6 +539,19 @@ export class Gateway {
       decision: outcome.status === 'approved' ? 'allow' : 'deny',
       reason: outcome.status === 'approved' ? `approved by owner (${outcome.id})` : `not approved (${outcome.status})`,
     });
+  }
+
+  /** Build the sandbox context for a skill-scoped run, if it is one. */
+  private sandboxFor(skill: string | null, workdir: string | undefined): SandboxContext | undefined {
+    if (!skill || !workdir) return undefined;
+    const record = this.d.skillStore.get(skill);
+    if (!record) return undefined;
+    return {
+      skill,
+      manifest: record.manifest,
+      workdir,
+      skillDir: join(this.d.cfg.resolved.skillsDir, skill),
+    };
   }
 
   // --------------------------------------------------------------- webhooks
@@ -404,7 +576,11 @@ export class Gateway {
 
   private sse(req: IncomingMessage, res: ServerResponse, url: URL): void {
     const runId = url.searchParams.get('run') ?? undefined;
-    const since = Number(url.searchParams.get('since') ?? 0);
+    // EventSource resends the last id it saw as a header on reconnect. Honouring
+    // it is the whole of offline replay for the dashboard: a phone that slept
+    // through ten minutes of a run wakes up and gets exactly what it missed.
+    const lastEventId = Number(req.headers['last-event-id'] ?? 0);
+    const since = lastEventId || Number(url.searchParams.get('since') ?? 0);
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -439,6 +615,15 @@ export class Gateway {
     }
     res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
     res.end(readFileSync(file));
+  }
+}
+
+/** Push endpoints are third-party URLs; show the host, never the token in the path. */
+function safeHost(endpoint: string): string {
+  try {
+    return new URL(endpoint).host;
+  } catch {
+    return 'unknown';
   }
 }
 

@@ -48,6 +48,8 @@ Then open http://127.0.0.1:7788.
 | Channels | `src/adapters` | BlueBubbles in/out, Telegram, downsample, notification rules |
 | Scheduler | `src/scheduler` | 5-field cron, file/webhook/poll triggers |
 | Voice | `src/voice` | WS audio transport, VAD + endpointing, whisper.cpp STT, Piper/`say` TTS, latency lanes, warm session, wake word |
+| Self-authoring | `src/skills` | Gap detection, dedup, capability manifests, sandbox enforcement, self-tests, trust ladder |
+| Phone | `src/gateway`, `public/` | Device pairing, Web Push (VAPID, no dev account), PWA + service worker, approval inbox |
 | Computer use | `src/computer` | Chrome over CDP, macOS GUI + screenshots, headed session lock |
 | Ops | `src/service`, `src/backup`, `src/doctor` | launchd, worker isolation, backup/restore, preflight |
 
@@ -103,6 +105,54 @@ curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.
 
 `swb voice status` reports what's wired up; `swb voice install` prints every
 optional upgrade (Piper voices, openWakeWord).
+
+## Skills it writes for itself
+
+When a run says it has no repeatable way to do something, that gap becomes a
+skill: dedup against what already exists, spawn a run whose only job is to
+author it, make that run write test cases and pass them against its own script,
+register it, then retry what you originally asked for.
+
+Every new skill declares a **capability manifest** in its frontmatter — the
+hosts, paths, commands and MCP servers it needs — and the runner enforces
+exactly that. Undeclared is denied, and the denial names the missing
+declaration so widening it is a reviewable diff rather than a quiet drift.
+
+```yaml
+network: [api.github.com]
+write-paths: [./out]
+commands: [git, node]
+```
+
+Trust is earned in three steps, and the last one is not automatic:
+
+| tier | may | how you get there |
+| --- | --- | --- |
+| sandboxed | read the workdir, nothing else | where every self-authored skill starts |
+| restricted | what its manifest declares | 3 clean runs, automatically |
+| trusted | *ask* for a tier-2 action | only you, from the Skills tab or `swb skills trust <name>` |
+
+Widening a manifest resets the trust tier — the record was earned under the old
+capabilities. Three failures in a row flags a skill for review rather than
+retiring it; whether the skill is broken or the world moved is a judgement call.
+
+## On your phone
+
+Add the dashboard to the Home Screen and it behaves like an app: an approval
+inbox with real buttons, push notifications that let you approve or deny from
+the notification itself, and a layout built for a thumb.
+
+```bash
+swb reach          # how a phone can actually get here
+swb device pair    # shows a code; type it into /pair.html on the phone
+swb push test      # prove notifications arrive
+```
+
+Web Push is implemented in `src/gateway/push.ts` rather than pulled in — it
+needs no Apple or Google developer account, just a self-generated VAPID keypair
+and RFC 8291. Each device gets its own token, so a lost phone costs one
+revocation instead of a rotation. On iOS push only works from a Home
+Screen-installed PWA, which is why the manifest and service worker exist.
 
 ## Safety model
 

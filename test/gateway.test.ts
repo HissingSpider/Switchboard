@@ -13,6 +13,9 @@ import { AgentRegistry } from '../dist/agents/registry.js';
 import { SkillRegistry } from '../dist/skills/loader.js';
 import { MessagePipeline } from '../dist/router/pipeline.js';
 import { Gateway } from '../dist/gateway/server.js';
+import { DeviceStore } from '../dist/gateway/devices.js';
+import { PushService } from '../dist/gateway/push.js';
+import { SkillStore } from '../dist/store/skills.js';
 import { HOOK_PATH } from '../dist/runner/hook.js';
 import { sandbox, fakeClaudeShim, waitFor, type Sandbox } from './helpers.ts';
 
@@ -47,7 +50,10 @@ function build() {
     agents,
     reply: async (threadId, text) => void replies.push({ threadId, text }),
   });
-  return { cfg, db, events, runs, sessions, artifacts, confirms, registry, agents, skills, pipeline, replies };
+  const devices = new DeviceStore(db);
+  const push = new PushService(db, events);
+  const skillStore = new SkillStore(db);
+  return { cfg, db, events, runs, sessions, artifacts, confirms, registry, agents, skills, pipeline, replies, devices, push, skillStore };
 }
 
 before(async () => {
@@ -224,5 +230,149 @@ describe('SSE', () => {
     }
     assert.match(seen, /sse probe/);
     await reader.cancel();
+  });
+});
+
+describe('device-scoped access', () => {
+  test('a paired device token works where the shared token would', async () => {
+    const { code } = ctx.devices.createPairingCode();
+    const claimed = ctx.devices.claim(code, 'test phone') as { device: { id: string }; token: string };
+
+    const res = await fetch(`${base}/api/status`, { headers: { authorization: `Bearer ${claimed.token}` } });
+    assert.equal(res.status, 200);
+
+    // …and stops working the moment it is revoked.
+    ctx.devices.revoke(claimed.device.id);
+    const after = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest(
+        { host: '127.0.0.1', port: gw.port, path: '/api/status', headers: { host: 'phone.example.ts.net', authorization: `Bearer ${claimed.token}` } },
+        (r) => {
+          r.resume();
+          resolve(r.statusCode ?? 0);
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(after, 401);
+  });
+
+  test('pairing codes are minted and listed', async () => {
+    const created = (await (await post('/api/devices/pair', {})).json()) as { code: string; expiresAt: string };
+    assert.match(created.code, /^[a-z0-9]{3}-[a-z0-9]{3}$/);
+    const listed = (await (await get('/api/devices')).json()) as { pending: Array<{ code: string }> };
+    assert.ok(listed.pending.some((p) => p.code === created.code));
+  });
+});
+
+describe('push endpoints', () => {
+  test('serves the VAPID public key', async () => {
+    const body = (await (await get('/api/push/key')).json()) as { publicKey: string };
+    assert.equal(Buffer.from(body.publicKey, 'base64url').length, 65);
+  });
+
+  test('accepts and lists a subscription without leaking the endpoint', async () => {
+    const { createECDH, randomBytes } = await import('node:crypto');
+    const ua = createECDH('prime256v1');
+    ua.generateKeys();
+    const res = await post('/api/push/subscribe', {
+      endpoint: 'https://push.example.com/very/secret/token',
+      keys: { p256dh: ua.getPublicKey().toString('base64url'), auth: randomBytes(16).toString('base64url') },
+    });
+    assert.equal(res.status, 201);
+    const listed = (await (await get('/api/push')).json()) as { subscriptions: Array<{ host: string }> };
+    assert.equal(listed.subscriptions[0]!.host, 'push.example.com');
+    assert.equal(JSON.stringify(listed).includes('secret'), false);
+  });
+
+  test('rejects a malformed subscription', async () => {
+    assert.equal((await post('/api/push/subscribe', { endpoint: 'https://x' })).status, 400);
+  });
+});
+
+describe('skill endpoints', () => {
+  test('the review queue surfaces flagged skills, and a flag can be cleared', async () => {
+    const { EMPTY_MANIFEST } = await import('../dist/skills/manifest.js');
+    ctx.skillStore.register({ name: 'gw-demo', manifest: EMPTY_MANIFEST });
+    ctx.skillStore.flag('gw-demo', 'failing');
+
+    const queue = (await (await get('/api/skills/review')).json()) as { queue: Array<{ name: string; flagged: boolean }> };
+    assert.ok(queue.queue.some((s) => s.name === 'gw-demo' && s.flagged));
+
+    await post('/api/skills/gw-demo/unflag', {});
+    assert.equal(ctx.skillStore.get('gw-demo')!.flagged, false);
+  });
+
+  test('trusted can be granted from the dashboard, and only from restricted', async () => {
+    const { EMPTY_MANIFEST } = await import('../dist/skills/manifest.js');
+    ctx.skillStore.register({ name: 'gw-trust', manifest: EMPTY_MANIFEST, trust: 'restricted' });
+    await post('/api/skills/gw-trust/trust', { trust: 'trusted' });
+    assert.equal(ctx.skillStore.get('gw-trust')!.trust, 'trusted');
+
+    // A sandboxed skill cannot jump straight to trusted.
+    ctx.skillStore.register({ name: 'gw-jump', manifest: EMPTY_MANIFEST });
+    await post('/api/skills/gw-jump/trust', { trust: 'trusted' });
+    assert.equal(ctx.skillStore.get('gw-jump')!.trust, 'sandboxed');
+  });
+
+  test('retire and restore round-trip', async () => {
+    const { EMPTY_MANIFEST } = await import('../dist/skills/manifest.js');
+    ctx.skillStore.register({ name: 'gw-retire', manifest: EMPTY_MANIFEST });
+    await post('/api/skills/gw-retire/retire', { reason: 'test' });
+    assert.ok(ctx.skillStore.get('gw-retire')!.retiredAt);
+    await post('/api/skills/gw-retire/restore', {});
+    assert.equal(ctx.skillStore.get('gw-retire')!.retiredAt, null);
+  });
+
+  test('404s an unknown skill', async () => {
+    assert.equal((await get('/api/skills/nope-not-real')).status, 404);
+  });
+});
+
+describe('offline replay', () => {
+  test('SSE resumes from Last-Event-ID and returns only what was missed', async () => {
+    const before = ctx.events.append({ runId: null, kind: 'system.start', summary: 'before the gap', data: {}, source: 'test' });
+    ctx.events.append({ runId: null, kind: 'system.start', summary: 'during the gap', data: {}, source: 'test' });
+
+    const res = await fetch(`${base}/events`, {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': String(before.id) },
+    });
+    const reader = res.body!.getReader();
+    const { value } = await reader.read();
+    const text = new TextDecoder().decode(value);
+    assert.match(text, /during the gap/);
+    assert.equal(text.includes('before the gap'), false);
+    await reader.cancel();
+  });
+
+  test('the websocket replays from a since cursor', async () => {
+    const marker = ctx.events.append({ runId: null, kind: 'system.start', summary: 'ws marker', data: {}, source: 'test' });
+    ctx.events.append({ runId: null, kind: 'system.start', summary: 'after ws marker', data: {}, source: 'test' });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${gw.port}/?since=${marker.id}&token=${TOKEN}`);
+    const backlog = await new Promise<{ events: Array<{ summary: string }>; resumed: boolean }>((resolve, reject) => {
+      ws.addEventListener('message', (ev) => resolve(JSON.parse(String((ev as MessageEvent).data))));
+      ws.addEventListener('error', () => reject(new Error('ws failed')));
+      setTimeout(() => reject(new Error('ws timed out')), 5000);
+    });
+    ws.close();
+    assert.equal(backlog.resumed, true);
+    assert.ok(backlog.events.some((e) => e.summary === 'after ws marker'));
+    assert.equal(backlog.events.some((e) => e.summary === 'ws marker'), false);
+  });
+});
+
+describe('PWA assets', () => {
+  test('serves the manifest, service worker and icons', async () => {
+    const manifest = await get('/manifest.webmanifest');
+    assert.equal(manifest.status, 200);
+    assert.match(manifest.headers.get('content-type') ?? '', /manifest\+json/);
+    const parsed = (await manifest.json()) as { start_url: string; icons: unknown[] };
+    assert.equal(parsed.start_url, '/');
+    assert.ok(parsed.icons.length >= 2);
+
+    assert.equal((await get('/sw.js')).status, 200);
+    assert.equal((await get('/icon-192.png')).status, 200);
+    assert.equal((await get('/pair.html')).status, 200);
   });
 });

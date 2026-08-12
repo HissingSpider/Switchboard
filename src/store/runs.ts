@@ -21,6 +21,8 @@ export interface RunRecord {
   sessionId: string | null;
   parentRunId: string | null;
   prompt: string;
+  /** Set when the run is executing inside one skill's capability manifest. */
+  skill: string | null;
   branch: string | null;
   exitCode: number | null;
   error: string | null;
@@ -47,6 +49,8 @@ interface Row {
   session_id: string | null;
   parent_run_id: string | null;
   prompt: string;
+  /** Set when the run is executing inside one skill's capability manifest. */
+  skill: string | null;
   branch: string | null;
   exit_code: number | null;
   error: string | null;
@@ -74,6 +78,7 @@ function toRun(r: Row): RunRecord {
     sessionId: r.session_id,
     parentRunId: r.parent_run_id,
     prompt: r.prompt,
+    skill: r.skill ?? null,
     branch: r.branch,
     exitCode: r.exit_code,
     error: r.error,
@@ -97,6 +102,7 @@ export interface CreateRunInput {
   threadId?: string | null;
   sessionId?: string | null;
   parentRunId?: string | null;
+  skill?: string | null;
 }
 
 export class RunStore {
@@ -105,8 +111,8 @@ export class RunStore {
   create(input: CreateRunInput): RunRecord {
     this.db
       .prepare(
-        `INSERT INTO runs (id, created_at, status, project, project_path, agent, task_class, intent, channel, thread_id, session_id, parent_run_id, prompt)
-         VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, created_at, status, project, project_path, agent, task_class, intent, channel, thread_id, session_id, parent_run_id, prompt, skill)
+         VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -121,6 +127,7 @@ export class RunStore {
         input.sessionId ?? null,
         input.parentRunId ?? null,
         input.prompt,
+        input.skill ?? null,
       );
     return this.get(input.id)!;
   }
@@ -154,6 +161,7 @@ export class RunStore {
       threadId: 'thread_id',
       sessionId: 'session_id',
       parentRunId: 'parent_run_id',
+      skill: 'skill',
       branch: 'branch',
       exitCode: 'exit_code',
       error: 'error',

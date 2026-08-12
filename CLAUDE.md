@@ -45,6 +45,7 @@ src/adapters   iMessage, Telegram     src/scheduler  cron + triggers
 src/computer   CDP, GUI, screen lock  src/service    launchd, worker isolation
 src/memory     non-project memory     src/backup     backup/restore
 src/voice      audio in/out, lanes, warm session
+src/net        reachability (tailnet vs LAN vs loopback)
 public/        dashboard              skills/        starter skills
 ```
 
@@ -69,6 +70,16 @@ public/        dashboard              skills/        starter skills
   parsing JSON where it expects PCM.
 - Voice never approves a gated action — confirmations escalate to text. Do not
   "improve" this by adding a spoken yes.
+- A request that presents a credential is judged on that credential alone, even
+  from loopback. Under `tailscale serve` every proxied request arrives from
+  127.0.0.1, so loopback-implies-trusted would let a revoked device back in.
+- The skill sandbox can only ever *narrow* a policy decision. It must never turn
+  a `confirm` or a `deny` into an `allow`.
+- `trusted` is the only trust tier a machine cannot grant itself, and that is
+  the point. Nothing a skill does is evidence it should be allowed to send,
+  publish, push or delete.
+- `display: inline-block` beats the `hidden` attribute. Anything with an
+  explicit display needs its own `[hidden] { display: none }`.
 
 ## Board
 

@@ -29,6 +29,8 @@ export interface SubmitRunInput {
   /** Resume the session bound to (threadId, agent, project). */
   continueSession?: boolean;
   parentRunId?: string;
+  /** Pin the run to one skill's capability manifest. */
+  skill?: string;
 }
 
 export interface ActiveRun {
@@ -130,6 +132,7 @@ export class RunRegistry extends EventEmitter {
       threadId: input.threadId ?? null,
       sessionId,
       parentRunId: input.parentRunId ?? null,
+      skill: input.skill ?? null,
     });
 
     this.events.append({

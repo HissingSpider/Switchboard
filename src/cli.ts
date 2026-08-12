@@ -21,6 +21,7 @@ import { WhisperCppStt, WHISPER_INSTALL_HELP } from './voice/stt.js';
 import { pickTts, MacSayTts, TTS_INSTALL_HELP } from './voice/tts.js';
 import { WAKE_WORD_HELP } from './voice/wakeword.js';
 import { pcmToWav } from './voice/types.js';
+import { checkReachability, formatReachability, serveCommand } from './net/reachability.js';
 import { boot } from './index.js';
 
 const out = (s: string): void => void process.stdout.write(`${s}\n`);
@@ -76,6 +77,10 @@ const HELP = `swb — Switchboard
   isolation status|script|sudoers
   computer perms|displays|watch
   voice status|say <text>|voices|latency|install
+  device list|pair|revoke <id>
+  push key|list|test
+  reach                       how a phone can actually reach this
+  skills review|trust <name>|retire <name>|restore <name>
   backup [dir] [--artifacts]  |  restore <archive>
 `;
 
@@ -417,6 +422,73 @@ async function main(): Promise<void> {
       out(`wake:     ${cfg.voice.wakeWord ?? 'off (push to talk)'}`);
       out(`client:   http://${cfg.gateway.host}:${cfg.gateway.port}/voice.html`);
       if (!stt.available) out(`\n${WHISPER_INSTALL_HELP}`);
+      return;
+    }
+
+    // --------------------------------------------------------------- device
+    case 'device': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'list';
+      if (sub === 'pair') {
+        const body = (await api(cfg, '/api/devices/pair', { method: 'POST' })) as { code: string; expiresAt: string };
+        return void out(
+          [`pairing code: ${body.code}`, `expires ${new Date(body.expiresAt).toLocaleTimeString()}`, '', `open http://<this-machine>:${cfg.gateway.port}/pair.html on the new device`].join('\n'),
+        );
+      }
+      if (sub === 'revoke') {
+        if (!args[1]) return void die('usage: swb device revoke <id>');
+        const body = (await api(cfg, `/api/devices/${args[1]}`, { method: 'DELETE' })) as { revoked: boolean };
+        return void out(body.revoked ? 'revoked' : 'no such active device');
+      }
+      const body = (await api(cfg, '/api/devices')) as { devices: Array<Record<string, unknown>> };
+      for (const d of body.devices) {
+        out(`${String(d.id).padEnd(9)} ${String(d.name).padEnd(18)} ${d.revokedAt ? 'revoked' : `seen ${d.lastSeenAt ?? 'never'}`}`);
+      }
+      return;
+    }
+
+    // ----------------------------------------------------------------- push
+    case 'push': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'list';
+      if (sub === 'key') return void out(((await api(cfg, '/api/push/key')) as { publicKey: string }).publicKey);
+      if (sub === 'test') {
+        const r = (await api(cfg, '/api/push/test', { method: 'POST' })) as { sent: number; failed: number };
+        return void out(`sent to ${r.sent} device(s), ${r.failed} failed`);
+      }
+      const body = (await api(cfg, '/api/push')) as { subscriptions: Array<Record<string, unknown>> };
+      if (!body.subscriptions.length) return void out('no push subscriptions — enable notifications from the dashboard Setup tab');
+      for (const s2 of body.subscriptions) out(`${String(s2.id).padEnd(9)} ${String(s2.host).padEnd(28)} ${s2.lastOkAt ?? 'never delivered'}`);
+      return;
+    }
+
+    case 'reach': {
+      const cfg = cfgOrDie();
+      const report = await checkReachability(cfg.gateway);
+      out(formatReachability(report));
+      if (report.problems.length) out(`\nto expose it to the tailnet only:\n  ${serveCommand(cfg.gateway.port)}`);
+      return;
+    }
+
+    // --------------------------------------------------------------- skills
+    case 'skills': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'review';
+      if (sub === 'trust' || sub === 'retire' || sub === 'restore') {
+        const name = args[1];
+        if (!name) return void die(`usage: swb skills ${sub} <name>`);
+        const path = sub === 'trust' ? `/api/skills/${name}/trust` : `/api/skills/${name}/${sub}`;
+        await api(cfg, path, { method: 'POST', body: JSON.stringify(sub === 'trust' ? { trust: 'trusted' } : {}) });
+        return void out(`${name}: ${sub === 'trust' ? 'granted trusted' : sub === 'retire' ? 'retired' : 'restored'}`);
+      }
+      const body = (await api(cfg, '/api/skills/review')) as {
+        queue: Array<{ name: string; trust: string; runs: number; successes: number; flagged: boolean; flagReason?: string; proposal?: string }>;
+      };
+      if (!body.queue.length) return void out('nothing needs review');
+      for (const s2 of body.queue) {
+        out(`${s2.name.padEnd(22)} ${s2.trust.padEnd(11)} ${s2.successes}/${s2.runs}${s2.flagged ? `  FLAGGED: ${s2.flagReason}` : ''}`);
+        if (s2.proposal) out(`  → ready for trusted: swb skills trust ${s2.name}`);
+      }
       return;
     }
 
