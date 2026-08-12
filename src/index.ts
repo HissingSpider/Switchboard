@@ -1,0 +1,198 @@
+import './core/warnings.js';
+import { join } from 'node:path';
+import { loadConfig, ConfigError, type LoadedConfig } from './config/load.js';
+import { configureLogger, logger } from './core/logger.js';
+import { openDb, kvSet, kvGet } from './store/db.js';
+import { EventLog } from './store/eventlog.js';
+import { RunStore } from './store/runs.js';
+import { SessionStore } from './store/sessions.js';
+import { ArtifactStore } from './store/artifacts.js';
+import { ConfirmService } from './policy/confirm.js';
+import { checkPolicyIntegrity } from './policy/policy.js';
+import { RunRegistry } from './runner/registry.js';
+import { FailureMonitor } from './runner/failures.js';
+import { AgentRegistry } from './agents/registry.js';
+import { SkillRegistry } from './skills/loader.js';
+import { MessagePipeline } from './router/pipeline.js';
+import { Gateway } from './gateway/server.js';
+import { gatewayToken, hookToken } from './gateway/auth.js';
+import { ImessageAdapter } from './adapters/imessage.js';
+import { TelegramAdapter } from './adapters/telegram.js';
+import { NotificationService } from './adapters/notify.js';
+import { Scheduler } from './scheduler/heartbeat.js';
+import type { ChannelAdapter } from './adapters/types.js';
+
+const log = logger('switchboard');
+
+export interface Daemon {
+  cfg: LoadedConfig;
+  stop: () => Promise<void>;
+}
+
+export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
+  const cfg = cfgOverride ?? loadConfig();
+  configureLogger({ level: cfg.logLevel, file: join(cfg.resolved.logsDir, 'switchboard.log') });
+
+  // --- storage ---------------------------------------------------------
+  const db = openDb(cfg.resolved.dbPath);
+  const events = new EventLog(db);
+  const runs = new RunStore(db);
+  const sessions = new SessionStore(db);
+  const artifacts = new ArtifactStore(cfg.resolved.artifactsDir);
+  const confirms = new ConfirmService(db, events, cfg.confirmTimeoutSec);
+
+  // --- integrity -------------------------------------------------------
+  const expected = kvGet(db, 'policy.hash');
+  const integrity = checkPolicyIntegrity(
+    cfg.resolved.configFile,
+    [cfg.resolved.scratchDir, ...cfg.projects.map((p) => p.path)],
+    expected,
+  );
+  if (!integrity.ok) {
+    // A changed hash is expected after a deliberate edit; a config living inside
+    // a worker-writable directory is not, and that one is fatal.
+    const fatal = integrity.problems.filter((p) => p.includes('worker-writable') || p.includes('missing'));
+    for (const p of integrity.problems) log.warn('policy integrity', { problem: p });
+    if (fatal.length) throw new Error(`refusing to start: ${fatal.join('; ')}`);
+  }
+  kvSet(db, 'policy.hash', integrity.hash);
+
+  // --- crash recovery --------------------------------------------------
+  const orphans = runs.reconcileOrphans();
+  const expiredConfirms = confirms.expireOrphans();
+  if (orphans.length || expiredConfirms) {
+    events.append({
+      runId: null,
+      kind: 'system.start',
+      source: 'system',
+      summary: `recovered from restart: ${orphans.length} orphaned runs, ${expiredConfirms} confirmations failed closed`,
+      data: { orphans },
+    });
+  }
+
+  // --- retention -------------------------------------------------------
+  const prunedEvents = events.prune(cfg.artifactRetentionDays * 2);
+  const prunedRuns = artifacts.prune(cfg.artifactRetentionDays);
+  sessions.prune(14);
+  if (prunedEvents || prunedRuns.length) {
+    log.info('retention', { prunedEvents, prunedRunDirs: prunedRuns.length });
+  }
+
+  // --- registries ------------------------------------------------------
+  const token = gatewayToken(cfg.gateway);
+  const hookTok = hookToken();
+  const registry = new RunRegistry(cfg, events, runs, sessions, artifacts, hookTok);
+  const failures = new FailureMonitor(events, runs, artifacts);
+  registry.on('finished', (rec) => failures.inspect(rec));
+  registry.start();
+
+  const agents = new AgentRegistry(cfg, join(cfg.resolved.dataDir, 'agents'));
+  agents.watchForChanges();
+  const skills = new SkillRegistry(cfg.resolved.skillsDir);
+
+  // --- channels --------------------------------------------------------
+  const attachmentDir = join(cfg.resolved.dataDir, 'attachments');
+  const imessage = new ImessageAdapter(cfg.imessage, attachmentDir);
+  const telegram = new TelegramAdapter(cfg.telegram, attachmentDir);
+  const adapters: ChannelAdapter[] = [imessage, telegram];
+
+  const notifications = new NotificationService(db, events, runs, cfg.notifications);
+  for (const a of adapters) notifications.register(a);
+  notifications.start();
+
+  const pipeline = new MessagePipeline({
+    cfg,
+    registry,
+    runs,
+    sessions,
+    events,
+    artifacts,
+    confirms,
+    agents,
+    reply: async (threadId, text, attachmentPaths) => {
+      // Reply on whichever adapter owns the thread; iMessage guids and Telegram
+      // chat ids don't collide, so trying both is safe and keeps this simple.
+      for (const a of adapters) {
+        if (!a.enabled) continue;
+        const ok = await a.send({ threadId, text, attachments: attachmentPaths });
+        if (ok) return true;
+      }
+      return false;
+    },
+  });
+  for (const a of adapters) a.onMessage = (msg) => pipeline.handle(msg);
+
+  const scheduler = new Scheduler(cfg, registry, events);
+
+  // --- gateway ---------------------------------------------------------
+  const gateway = new Gateway({
+    cfg,
+    events,
+    runs,
+    sessions,
+    artifacts,
+    registry,
+    confirms,
+    agents,
+    skills,
+    pipeline,
+    imessage,
+    scheduler,
+    token,
+    hookToken: hookTok,
+  });
+
+  await gateway.start();
+  for (const a of adapters) await a.start();
+  scheduler.start();
+
+  events.append({
+    runId: null,
+    kind: 'system.start',
+    source: 'system',
+    summary: `Switchboard up on http://${cfg.gateway.host}:${cfg.gateway.port} — ${cfg.projects.length} projects, ${agents.all().length} agents, ${skills.all().length} skills`,
+    data: { projects: cfg.projects.map((p) => p.name), imessage: cfg.imessage.enabled, telegram: cfg.telegram.enabled },
+  });
+  log.info('ready', { url: `http://${cfg.gateway.host}:${cfg.gateway.port}`, token: token.slice(0, 6) + '…' });
+
+  let stopping = false;
+  const stop = async (): Promise<void> => {
+    if (stopping) return;
+    stopping = true;
+    events.append({ runId: null, kind: 'system.stop', source: 'system', summary: 'Switchboard shutting down', data: {} });
+    scheduler.stop();
+    notifications.stop();
+    agents.stopWatching();
+    for (const a of adapters) await a.stop();
+    await registry.stop();
+    await gateway.stop();
+    db.close();
+  };
+
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(sig, () => {
+      void stop().then(() => process.exit(0));
+    });
+  }
+  process.on('uncaughtException', (err) => {
+    log.error('uncaught exception', { err: err.message, stack: err.stack });
+    events.append({ runId: null, kind: 'system.error', source: 'system', summary: `uncaught: ${err.message}`, data: { stack: err.stack } });
+  });
+  process.on('unhandledRejection', (reason) => {
+    log.error('unhandled rejection', { reason: String(reason) });
+  });
+
+  return { cfg, stop };
+}
+
+const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  boot().catch((err: unknown) => {
+    if (err instanceof ConfigError) {
+      process.stderr.write(`${err.message}\n`);
+      process.exit(2);
+    }
+    process.stderr.write(`failed to start: ${(err as Error).stack ?? String(err)}\n`);
+    process.exit(1);
+  });
+}

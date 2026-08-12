@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Switchboard</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Switchboard</h1>
+      <div id="summary" class="summary">connecting…</div>
+      <nav>
+        <button data-tab="live" class="active">Live</button>
+        <button data-tab="history">History</button>
+        <button data-tab="board">Board</button>
+        <button data-tab="cost">Cost</button>
+        <button data-tab="config">Config</button>
+      </nav>
+    </header>
+
+    <div id="confirmations" class="confirmations" hidden></div>
+
+    <main>
+      <!-- LIVE ------------------------------------------------------- -->
+      <section id="tab-live" class="tab active">
+        <form id="submit" class="submit">
+          <textarea id="prompt" rows="2" placeholder="what should it do?  (⌘↵ to send)"></textarea>
+          <div class="row">
+            <select id="project"><option value="">no project (scratch)</option></select>
+            <select id="agent"><option value="">default agent</option></select>
+            <select id="class">
+              <option value="">auto</option>
+              <option value="coding">coding</option>
+              <option value="assistant">assistant</option>
+              <option value="computer-use">computer-use</option>
+            </select>
+            <button type="submit">Run</button>
+          </div>
+        </form>
+
+        <div class="split">
+          <aside id="runlist" class="runlist"></aside>
+          <div class="stream">
+            <div id="runhead" class="runhead">pick a run</div>
+            <div id="events" class="events"></div>
+            <form id="followup" class="followup" hidden>
+              <input id="followtext" placeholder="say something to this run…" />
+              <button type="submit">Send</button>
+              <button type="button" id="killbtn" class="danger">Kill</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- HISTORY ---------------------------------------------------- -->
+      <section id="tab-history" class="tab">
+        <div class="row">
+          <input id="search" placeholder="search prompts, results, ids…" />
+          <select id="filter-status">
+            <option value="">any status</option>
+            <option>done</option>
+            <option>failed</option>
+            <option>killed</option>
+            <option>running</option>
+          </select>
+          <select id="filter-project"><option value="">any project</option></select>
+        </div>
+        <table id="history"></table>
+      </section>
+
+      <!-- BOARD ------------------------------------------------------ -->
+      <section id="tab-board" class="tab">
+        <div id="board" class="board"></div>
+      </section>
+
+      <!-- COST ------------------------------------------------------- -->
+      <section id="tab-cost" class="tab">
+        <div id="cost"></div>
+      </section>
+
+      <!-- CONFIG ----------------------------------------------------- -->
+      <section id="tab-config" class="tab">
+        <div id="config"></div>
+      </section>
+    </main>
+
+    <!-- DIFF ------------------------------------------------------- -->
+    <dialog id="diffbox">
+      <header>
+        <strong id="difftitle">diff</strong><button id="diffclose">close</button>
+      </header>
+      <pre id="diff"></pre>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,424 @@
+#!/usr/bin/env node
+import './core/warnings.js';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, cpSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadConfig, writeExampleConfig, configPath, ConfigError, type LoadedConfig } from './config/load.js';
+import { runDoctor, formatChecks, doctorExitCode } from './doctor/doctor.js';
+import { gatewayToken, newToken } from './gateway/auth.js';
+import { setSecret, getSecret, deleteSecret, listSecrets, keychainRef } from './secrets/keychain.js';
+import { SkillRegistry } from './skills/loader.js';
+import { scaffoldSkill, testSkill } from './skills/scaffold.js';
+import { installService, uninstallService, serviceStatus, restartService, renderPlist, plistPath } from './service/launchd.js';
+import { isolationStatus, setupScript, sudoersSnippet } from './service/isolation.js';
+import { backup, restore, planRestore, pruneBackups } from './backup/backup.js';
+import { checkPermissions, PERMISSION_HELP, listDisplays } from './computer/gui.js';
+import { HeadedSessionManager, SCREEN_SHARING_HELP } from './computer/session.js';
+import { describeCron } from './scheduler/cron.js';
+import { WorkspaceMemory } from './memory/workspace.js';
+import { boot } from './index.js';
+
+const out = (s: string): void => void process.stdout.write(`${s}\n`);
+const die = (s: string, code = 1): never => {
+  process.stderr.write(`${s}\n`);
+  process.exit(code);
+};
+
+function cfgOrDie(): LoadedConfig {
+  try {
+    return loadConfig();
+  } catch (err) {
+    if (err instanceof ConfigError) return die(`${err.message}\n\nRun \`swb init\` to write a starter config.`, 2);
+    throw err;
+  }
+}
+
+async function api(cfg: LoadedConfig, path: string, init: RequestInit = {}): Promise<unknown> {
+  const url = `http://${cfg.gateway.host}:${cfg.gateway.port}${path}`;
+  const res = await fetch(url, {
+    ...init,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${gatewayToken(cfg.gateway)}`, ...(init.headers ?? {}) },
+    signal: AbortSignal.timeout(30_000),
+  }).catch((err: Error) => die(`gateway not reachable at ${url} (${err.message}) — is the daemon running? \`swb start\``));
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) die(`${res.status}: ${JSON.stringify(body)}`);
+  return body;
+}
+
+const HELP = `swb — Switchboard
+
+  init                        write a starter config
+  doctor                      preflight every dependency
+  start                       run the daemon in the foreground
+  status                      what is running right now
+  run <text>                  submit a run (--project, --agent, --class)
+  runs [n]                    recent runs (--project, --status, --search)
+  show <id>                   one run in detail
+  kill <id>                   stop a run
+  tell <id> <text>            inject a follow-up into a live run
+  diff <id>                   the diff a run produced
+  cost                        spend this month, by project
+
+  agent list|reload|new <name>
+  skill list|new <name> <description>|test <name> [phrases…]
+  memory list|show <scope>|add <scope> <text>|forget <scope>
+  schedule list
+
+  secret set <name>|get <name>|list|rm <name>
+  token show|rotate
+
+  service install|uninstall|status|restart|plist
+  isolation status|script|sudoers
+  computer perms|displays|watch
+  backup [dir] [--artifacts]  |  restore <archive>
+`;
+
+async function main(): Promise<void> {
+  const [, , cmd = 'help', ...rest] = process.argv;
+  const flags = parseFlags(rest);
+  const args = flags._;
+
+  switch (cmd) {
+    // ---------------------------------------------------------------- setup
+    case 'init': {
+      const path = configPath();
+      if (existsSync(path) && !flags.force) return void out(`${path} already exists (use --force to overwrite)`);
+      writeExampleConfig(path);
+      const cfg = loadConfig(path);
+      mkdirSync(join(cfg.resolved.dataDir, 'agents'), { recursive: true });
+      writeFileSync(
+        join(cfg.resolved.dataDir, 'agents', 'dev.md'),
+        `---\nname: dev\ndescription: writes code in real repos\ntaskClass: coding\npermissionProfile: coding\ndefaultFor: [imessage, dashboard]\n---\nYou are terse. Never push. End with the files you changed.\n`,
+      );
+      // Seed the skills directory from the starter skills that ship with the repo.
+      const bundled = fileURLToPath(new URL('../skills', import.meta.url));
+      let seeded = 0;
+      if (existsSync(bundled)) {
+        for (const name of readdirSync(bundled)) {
+          const target = join(cfg.resolved.skillsDir, name);
+          if (existsSync(target)) continue;
+          cpSync(join(bundled, name), target, { recursive: true });
+          seeded++;
+        }
+      }
+      return void out(
+        [`wrote ${path}`, `data dir ${cfg.resolved.dataDir}`, seeded ? `seeded ${seeded} starter skill(s)` : '', '', 'next: edit the config, then `swb doctor`']
+          .filter(Boolean)
+          .join('\n'),
+      );
+    }
+
+    case 'doctor': {
+      const checks = await runDoctor(cfgOrDie());
+      out(formatChecks(checks));
+      process.exit(doctorExitCode(checks));
+      return;
+    }
+
+    case 'start': {
+      await boot();
+      return; // boot installs signal handlers and keeps the process alive
+    }
+
+    // ----------------------------------------------------------------- runs
+    case 'status': {
+      const cfg = cfgOrDie();
+      const s = (await api(cfg, '/api/status')) as Record<string, unknown>;
+      const { runs } = (await api(cfg, '/api/runs?limit=8')) as { runs: Array<Record<string, unknown>> };
+      out(`${s.active}/${s.capacity} running, ${s.queued} queued — $${Number(s.monthSpendUsd).toFixed(2)}/$${s.monthBudgetUsd} this month`);
+      if (s.pendingConfirmations) out(`${s.pendingConfirmations} confirmation(s) waiting on you`);
+      for (const r of runs) out(`  ${r.id} ${String(r.status).padEnd(7)} ${String(r.project ?? '-').padEnd(12)} ${String(r.prompt).slice(0, 60)}`);
+      return;
+    }
+
+    case 'run': {
+      const cfg = cfgOrDie();
+      const prompt = args.join(' ');
+      if (!prompt) return void die('nothing to run');
+      const body = (await api(cfg, '/api/runs', {
+        method: 'POST',
+        body: JSON.stringify({ prompt, project: flags.project, agent: flags.agent, taskClass: flags.class, threadId: 'cli' }),
+      })) as { run: { id: string } };
+      return void out(body.run.id);
+    }
+
+    case 'runs': {
+      const cfg = cfgOrDie();
+      const params = new URLSearchParams({ limit: String(args[0] ?? flags.limit ?? 20) });
+      if (flags.project) params.set('project', String(flags.project));
+      if (flags.status) params.set('status', String(flags.status));
+      if (flags.search) params.set('q', String(flags.search));
+      const { runs } = (await api(cfg, `/api/runs?${params}`)) as { runs: Array<Record<string, unknown>> };
+      for (const r of runs) {
+        out(
+          `${r.id} ${String(r.status).padEnd(7)} ${String(r.createdAt).slice(0, 16).replace('T', ' ')} ${String(r.project ?? '-').padEnd(10)} $${Number(r.costUsd).toFixed(3).padStart(7)} ${String(r.prompt).slice(0, 50)}`,
+        );
+      }
+      return;
+    }
+
+    case 'show': {
+      const cfg = cfgOrDie();
+      if (!args[0]) return void die('usage: swb show <run-id>');
+      const body = (await api(cfg, `/api/runs/${args[0]}`)) as { run: Record<string, unknown>; artifacts: Array<{ name: string; bytes: number }> };
+      out(JSON.stringify(body.run, null, 2));
+      out(`artifacts: ${body.artifacts.map((a) => `${a.name} (${a.bytes}b)`).join(', ') || 'none'}`);
+      return;
+    }
+
+    case 'kill': {
+      const cfg = cfgOrDie();
+      if (!args[0]) return void die('usage: swb kill <run-id>');
+      const body = (await api(cfg, `/api/runs/${args[0]}`, { method: 'DELETE' })) as { killed: boolean };
+      return void out(body.killed ? 'killed' : 'no live run matched');
+    }
+
+    case 'tell': {
+      const cfg = cfgOrDie();
+      const [id, ...text] = args;
+      if (!id || !text.length) return void die('usage: swb tell <run-id> <text>');
+      const body = (await api(cfg, `/api/runs/${id}/followup`, { method: 'POST', body: JSON.stringify({ text: text.join(' ') }) })) as {
+        delivered: boolean;
+      };
+      return void out(body.delivered ? 'delivered' : 'run is not accepting input');
+    }
+
+    case 'diff': {
+      const cfg = cfgOrDie();
+      if (!args[0]) return void die('usage: swb diff <run-id>');
+      const res = await fetch(`http://${cfg.gateway.host}:${cfg.gateway.port}/api/runs/${args[0]}/diff`, {
+        headers: { authorization: `Bearer ${gatewayToken(cfg.gateway)}` },
+      });
+      return void out((await res.text()) || 'no diff');
+    }
+
+    case 'cost': {
+      const cfg = cfgOrDie();
+      const body = (await api(cfg, '/api/cost')) as { monthSpendUsd: number; monthBudgetUsd: number; byProject: Array<{ project: string; costUsd: number; runs: number }> };
+      out(`$${body.monthSpendUsd.toFixed(2)} of $${body.monthBudgetUsd} this month`);
+      for (const p of body.byProject) out(`  ${p.project.padEnd(16)} $${Number(p.costUsd).toFixed(2)} (${p.runs} runs)`);
+      return;
+    }
+
+    // --------------------------------------------------------------- agents
+    case 'agent': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'list';
+      const dir = join(cfg.resolved.dataDir, 'agents');
+      if (sub === 'new') {
+        const name = args[1];
+        if (!name) return void die('usage: swb agent new <name>');
+        mkdirSync(dir, { recursive: true });
+        const file = join(dir, `${name}.md`);
+        if (existsSync(file)) return void die(`${file} already exists`);
+        writeFileSync(
+          file,
+          `---\nname: ${name}\ndescription: \nmodel: \ntaskClass: coding\npermissionProfile: coding\nmemoryProject: \ndefaultProject: \ndefaultFor: []\n---\nDescribe how this agent should behave. This body becomes the persona.\n`,
+        );
+        return void out(`wrote ${file} — edit it, then \`swb agent reload\``);
+      }
+      if (sub === 'reload') {
+        const body = (await api(cfg, '/api/agents/reload', { method: 'POST' })) as { count: number; problems: string[] };
+        out(`${body.count} agents`);
+        for (const p of body.problems) out(`  ! ${p}`);
+        return;
+      }
+      const body = (await api(cfg, '/api/agents')) as { agents: Array<Record<string, unknown>>; problems: string[] };
+      for (const a of body.agents) out(`${String(a.name).padEnd(14)} ${a.taskClass ?? 'coding'}  ${a.description ?? ''}`);
+      for (const p of body.problems) out(`  ! ${p}`);
+      return;
+    }
+
+    // --------------------------------------------------------------- skills
+    case 'skill': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'list';
+      const registry = new SkillRegistry(cfg.resolved.skillsDir);
+      if (sub === 'new') {
+        const [, name, ...desc] = args;
+        if (!name || !desc.length) return void die('usage: swb skill new <name> <description…>');
+        const r = scaffoldSkill(cfg.resolved.skillsDir, name, desc.join(' '));
+        return void out(`created ${r.dir}\n  ${r.files.join('\n  ')}`);
+      }
+      if (sub === 'test') {
+        const [, name, ...phrases] = args;
+        if (!name) return void die('usage: swb skill test <name> [phrases…]');
+        const r = testSkill(cfg.resolved.skillsDir, name, phrases);
+        out(`${r.ok ? 'ok' : 'problems'}: ${name}`);
+        for (const p of r.problems) out(`  ! ${p}`);
+        for (const s of r.selectedBy) out(`  ✓ selected by "${s}"`);
+        return void (r.ok ? undefined : process.exit(1));
+      }
+      const all = registry.all();
+      if (!all.length) return void out(`no skills in ${cfg.resolved.skillsDir} — \`swb skill new <name> <description>\``);
+      for (const s of all) out(`${s.name.padEnd(20)} ${s.description.slice(0, 70)}`);
+      for (const v of registry.validate()) out(`  ! ${v.skill}: ${v.problems.join(', ')}`);
+      return;
+    }
+
+    // --------------------------------------------------------------- memory
+    case 'memory': {
+      const cfg = cfgOrDie();
+      const mem = new WorkspaceMemory(join(cfg.resolved.dataDir, 'memory'));
+      const sub = args[0] ?? 'list';
+      if (sub === 'add') {
+        const [, scope, ...text] = args;
+        if (!scope || !text.length) return void die('usage: swb memory add <scope> <text…>');
+        const e = mem.append(scope, text.join(' '));
+        return void out(`${e.id} → ${scope}`);
+      }
+      if (sub === 'show') {
+        if (!args[1]) return void die('usage: swb memory show <scope>');
+        return void out(mem.read(args[1]) || '(empty)');
+      }
+      if (sub === 'forget') {
+        if (!args[1]) return void die('usage: swb memory forget <scope>');
+        return void out(mem.forget(args[1]) ? 'forgotten' : 'no such scope');
+      }
+      return void out(mem.scopes().join('\n') || '(no scopes yet)');
+    }
+
+    case 'schedule': {
+      const cfg = cfgOrDie();
+      for (const j of cfg.heartbeats) out(`${j.name.padEnd(20)} ${j.cron.padEnd(16)} ${describeCron(j.cron)}`);
+      for (const t of cfg.triggers) out(`${t.name.padEnd(20)} ${t.kind.padEnd(16)} ${t.target}`);
+      return;
+    }
+
+    // -------------------------------------------------------------- secrets
+    case 'secret': {
+      const sub = args[0];
+      if (sub === 'set') {
+        const [, name, ...value] = args;
+        if (!name) return void die('usage: swb secret set <name> [value]  (omit value to read stdin)');
+        const v = value.length ? value.join(' ') : (await readStdin()).trim();
+        if (!v) return void die('no value given');
+        setSecret(name, v);
+        return void out(`stored. reference it as "${keychainRef(name)}"`);
+      }
+      if (sub === 'get') {
+        if (!args[1]) return void die('usage: swb secret get <name>');
+        const v = getSecret(args[1]);
+        return void (v ? out(v) : die('not found'));
+      }
+      if (sub === 'rm') {
+        if (!args[1]) return void die('usage: swb secret rm <name>');
+        return void out(deleteSecret(args[1]) ? 'deleted' : 'not found');
+      }
+      const names = await listSecrets();
+      return void out(names.join('\n') || '(none)');
+    }
+
+    case 'token': {
+      const cfg = cfgOrDie();
+      if (args[0] === 'rotate') return void out(newToken());
+      return void out(gatewayToken(cfg.gateway));
+    }
+
+    // -------------------------------------------------------------- service
+    case 'service': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'status';
+      const entry = fileURLToPath(new URL('./index.js', import.meta.url));
+      if (sub === 'install') {
+        const path = await installService({ entry, dataDir: cfg.resolved.dataDir, configPath: cfg.resolved.configFile, caffeinate: flags.caffeinate !== false });
+        return void out(`installed ${path}\nlogs: ${join(cfg.resolved.logsDir, 'daemon.out.log')}`);
+      }
+      if (sub === 'uninstall') return void out((await uninstallService()) ? 'uninstalled' : 'was not installed');
+      if (sub === 'restart') {
+        await restartService();
+        return void out('restarted');
+      }
+      if (sub === 'plist') return void out(renderPlist({ entry, dataDir: cfg.resolved.dataDir, configPath: cfg.resolved.configFile }));
+      const s = await serviceStatus();
+      return void out(`plist: ${plistPath()}\ninstalled: ${s.installed}\nrunning: ${s.running}${s.pid ? ` (pid ${s.pid})` : ''}${s.lastExit ? ` last exit ${s.lastExit}` : ''}`);
+    }
+
+    case 'isolation': {
+      const sub = args[0] ?? 'status';
+      if (sub === 'script') return void out(setupScript());
+      if (sub === 'sudoers') return void out(sudoersSnippet());
+      const s = await isolationStatus();
+      out(`worker user exists: ${s.userExists}${s.homeDir ? ` (${s.homeDir})` : ''}`);
+      out(`admin: ${s.isAdmin}`);
+      for (const p of s.problems) out(`  ! ${p}`);
+      if (!s.userExists) out('\nrun `swb isolation script > setup.sh` and read it before `sudo bash setup.sh`');
+      return;
+    }
+
+    // ------------------------------------------------------------- computer
+    case 'computer': {
+      const sub = args[0] ?? 'perms';
+      if (sub === 'displays') {
+        for (const d of await listDisplays()) out(`display ${d.index}: ${d.width}x${d.height}`);
+        return;
+      }
+      if (sub === 'watch') {
+        const mgr = new HeadedSessionManager();
+        const url = await mgr.watchUrl();
+        return void out(url ? `open ${url}` : SCREEN_SHARING_HELP);
+      }
+      const p = await checkPermissions();
+      out(`screen recording: ${p.screenRecording ? 'ok' : 'MISSING'}`);
+      out(`accessibility:    ${p.accessibility ? 'ok' : 'MISSING'}`);
+      for (const d of p.detail) out(`  ${d}`);
+      if (!p.screenRecording || !p.accessibility) out(`\n${PERMISSION_HELP}`);
+      return;
+    }
+
+    // --------------------------------------------------------------- backup
+    case 'backup': {
+      const cfg = cfgOrDie();
+      const dir = args[0] ?? join(cfg.resolved.dataDir, 'backups');
+      const r = await backup(cfg, dir, { artifacts: Boolean(flags.artifacts) });
+      const pruned = pruneBackups(dir, Number(flags.keep ?? 7));
+      return void out(`${r.path} (${(r.bytes / 1e6).toFixed(1)} MB)${pruned.length ? `\npruned ${pruned.length} old archive(s)` : ''}`);
+    }
+
+    case 'restore': {
+      const cfg = cfgOrDie();
+      if (!args[0]) return void die('usage: swb restore <archive.tar.gz>');
+      const plan = await planRestore(cfg, args[0]);
+      if (plan.conflicts.length && !flags.force) {
+        return void die(`would overwrite:\n  ${plan.conflicts.join('\n  ')}\nre-run with --force (the existing data dir is moved aside, not deleted)`);
+      }
+      const r = await restore(cfg, args[0]);
+      return void out(`restored into ${r.restoredTo}${r.previousMovedTo ? `\nprevious data dir moved to ${r.previousMovedTo}` : ''}`);
+    }
+
+    default:
+      return void out(HELP);
+  }
+}
+
+interface Flags {
+  _: string[];
+  [k: string]: string | boolean | string[] | undefined;
+}
+
+function parseFlags(argv: string[]): Flags {
+  const flags: Flags = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a.startsWith('--')) {
+      const [key, inline] = a.slice(2).split('=');
+      if (inline !== undefined) flags[key!] = inline;
+      else if (argv[i + 1] && !argv[i + 1]!.startsWith('--')) flags[key!] = argv[++i]!;
+      else flags[key!] = true;
+    } else {
+      (flags._ as string[]).push(a);
+    }
+  }
+  return flags;
+}
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => (buf += c));
+    process.stdin.on('end', () => resolve(buf));
+  });
+}
+
+main().catch((err: unknown) => die((err as Error).stack ?? String(err)));

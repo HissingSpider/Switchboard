@@ -1,0 +1,31 @@
+{
+  "name": "switchboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal agent bridge: iMessage + dashboard over one gateway that routes intents and delegates real work to claude -p.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "swb": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node --experimental-strip-types --watch src/index.ts",
+    "start": "node dist/index.js",
+    "cli": "node dist/cli.js",
+    "doctor": "node dist/cli.js doctor",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --experimental-strip-types --test test/*.test.ts",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}
