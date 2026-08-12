@@ -2,6 +2,7 @@
 import './core/warnings.js';
 import { existsSync, writeFileSync, mkdirSync, readdirSync, cpSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, writeExampleConfig, configPath, ConfigError, type LoadedConfig } from './config/load.js';
 import { runDoctor, formatChecks, doctorExitCode } from './doctor/doctor.js';
@@ -16,6 +17,10 @@ import { checkPermissions, PERMISSION_HELP, listDisplays } from './computer/gui.
 import { HeadedSessionManager, SCREEN_SHARING_HELP } from './computer/session.js';
 import { describeCron } from './scheduler/cron.js';
 import { WorkspaceMemory } from './memory/workspace.js';
+import { WhisperCppStt, WHISPER_INSTALL_HELP } from './voice/stt.js';
+import { pickTts, MacSayTts, TTS_INSTALL_HELP } from './voice/tts.js';
+import { WAKE_WORD_HELP } from './voice/wakeword.js';
+import { pcmToWav } from './voice/types.js';
 import { boot } from './index.js';
 
 const out = (s: string): void => void process.stdout.write(`${s}\n`);
@@ -70,6 +75,7 @@ const HELP = `swb — Switchboard
   service install|uninstall|status|restart|plist
   isolation status|script|sudoers
   computer perms|displays|watch
+  voice status|say <text>|voices|latency|install
   backup [dir] [--artifacts]  |  restore <archive>
 `;
 
@@ -363,6 +369,54 @@ async function main(): Promise<void> {
       out(`accessibility:    ${p.accessibility ? 'ok' : 'MISSING'}`);
       for (const d of p.detail) out(`  ${d}`);
       if (!p.screenRecording || !p.accessibility) out(`\n${PERMISSION_HELP}`);
+      return;
+    }
+
+    // ---------------------------------------------------------------- voice
+    case 'voice': {
+      const cfg = cfgOrDie();
+      const sub = args[0] ?? 'status';
+
+      if (sub === 'voices') return void out(MacSayTts.voices().join('\n') || '(none)');
+
+      if (sub === 'install') {
+        return void out([WHISPER_INSTALL_HELP, '', TTS_INSTALL_HELP, '', WAKE_WORD_HELP].join('\n'));
+      }
+
+      if (sub === 'say') {
+        const text = args.slice(1).join(' ');
+        if (!text) return void die('usage: swb voice say <text>');
+        // Synthesise and play locally — the quickest way to hear the voice.
+        const tts = pickTts({ engine: cfg.voice.ttsEngine, voice: cfg.voice.ttsVoice, piperModel: cfg.voice.piperModel });
+        if (!tts.available) return void die(`${tts.name} is not available`);
+        const pcm = await tts.synthesize(text);
+        const wavPath = join(cfg.resolved.dataDir, 'voice-preview.wav');
+        mkdirSync(cfg.resolved.dataDir, { recursive: true });
+        writeFileSync(wavPath, pcmToWav(pcm));
+        await new Promise<void>((resolve) => {
+          const child = spawn('afplay', [wavPath], { stdio: 'ignore' });
+          child.on('close', () => resolve());
+          child.on('error', () => resolve());
+        });
+        return void out(`${tts.name}: ${wavPath}`);
+      }
+
+      if (sub === 'latency') {
+        const body = (await api(cfg, '/api/voice')) as { latency: Array<{ lane: string; count: number; p50: number; p95: number }> };
+        if (!body.latency.length) return void out('no turns recorded yet');
+        for (const row of body.latency) out(`${row.lane.padEnd(9)} n=${String(row.count).padStart(4)}  p50 ${row.p50}ms  p95 ${row.p95}ms`);
+        return;
+      }
+
+      const stt = new WhisperCppStt({ binary: cfg.voice.whisperBinary, model: cfg.voice.whisperModel });
+      const tts = pickTts({ engine: cfg.voice.ttsEngine, voice: cfg.voice.ttsVoice, piperModel: cfg.voice.piperModel });
+      out(`enabled:  ${cfg.voice.enabled}`);
+      out(`stt:      ${stt.available ? stt.detail : `UNAVAILABLE — ${stt.detail}`}`);
+      out(`tts:      ${tts.name}${tts.available ? '' : ' UNAVAILABLE'}`);
+      out(`mic mode: ${cfg.voice.openMic ? 'open mic' : 'push to talk'}`);
+      out(`wake:     ${cfg.voice.wakeWord ?? 'off (push to talk)'}`);
+      out(`client:   http://${cfg.gateway.host}:${cfg.gateway.port}/voice.html`);
+      if (!stt.available) out(`\n${WHISPER_INSTALL_HELP}`);
       return;
     }
 

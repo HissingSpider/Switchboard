@@ -9,6 +9,9 @@ import { checkPolicyIntegrity } from '../policy/policy.js';
 import { isRepo } from '../runner/git.js';
 import { SkillRegistry } from '../skills/loader.js';
 import { parseCron } from '../scheduler/cron.js';
+import { WhisperCppStt, WHISPER_INSTALL_HELP } from '../voice/stt.js';
+import { pickTts, TTS_INSTALL_HELP } from '../voice/tts.js';
+import { WakeWordDetector, WAKE_WORD_HELP } from '../voice/wakeword.js';
 
 const exec = promisify(execFile);
 
@@ -237,6 +240,37 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
     } catch (err) {
       add({ name: `heartbeat: ${job.name}`, status: 'fail', detail: (err as Error).message });
     }
+  }
+
+  // --- voice ----------------------------------------------------------
+  if (cfg.voice.enabled) {
+    const stt = new WhisperCppStt({ binary: cfg.voice.whisperBinary, model: cfg.voice.whisperModel });
+    add({
+      name: 'voice: STT',
+      status: stt.available ? 'ok' : 'warn',
+      detail: stt.detail,
+      fix: stt.available ? undefined : WHISPER_INSTALL_HELP,
+    });
+
+    const tts = pickTts({ engine: cfg.voice.ttsEngine, voice: cfg.voice.ttsVoice, piperModel: cfg.voice.piperModel });
+    add({
+      name: 'voice: TTS',
+      status: tts.available ? 'ok' : 'fail',
+      detail: `${tts.name}${tts.available ? '' : ' — unavailable'}`,
+      fix: tts.name === 'macos-say' && tts.available ? TTS_INSTALL_HELP : undefined,
+    });
+
+    if (cfg.voice.wakeWord) {
+      const pythonOk = WakeWordDetector.pythonAvailable();
+      add({
+        name: 'voice: wake word',
+        status: pythonOk ? 'warn' : 'fail',
+        detail: pythonOk ? `"${cfg.voice.wakeWord}" — python found, openwakeword not verified until first start` : 'no python3 found',
+        fix: WAKE_WORD_HELP,
+      });
+    }
+  } else {
+    add({ name: 'voice', status: 'warn', detail: 'voice disabled in config' });
   }
 
   // --- caps -----------------------------------------------------------

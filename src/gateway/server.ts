@@ -22,6 +22,8 @@ import type { ImessageAdapter } from '../adapters/imessage.js';
 import type { MessagePipeline } from '../router/pipeline.js';
 import type { Scheduler } from '../scheduler/heartbeat.js';
 import { children } from '../agents/handoff.js';
+import type { VoiceServer } from '../voice/transport.js';
+import { VOICE_PATH } from '../voice/transport.js';
 
 const log = logger('gateway');
 
@@ -48,6 +50,7 @@ export interface GatewayDeps {
   pipeline: MessagePipeline;
   imessage?: ImessageAdapter;
   scheduler?: Scheduler;
+  voice?: VoiceServer;
   token: string;
   hookToken: string;
 }
@@ -63,6 +66,8 @@ export interface GatewayDeps {
 export class Gateway {
   private server: Server | null = null;
   private wss: WebSocketServer | null = null;
+  /** Separate server for /voice: those sockets carry audio, not the event log. */
+  private voiceWss: WebSocketServer | null = null;
   private readonly staticRoot: string;
 
   constructor(private readonly d: GatewayDeps) {
@@ -73,6 +78,7 @@ export class Gateway {
     const { cfg } = this.d;
     this.server = createServer((req, res) => void this.route(req, res));
     this.wss = new WebSocketServer({ noServer: true });
+    this.voiceWss = new WebSocketServer({ noServer: true });
 
     this.server.on('upgrade', (req, socket, head) => {
       const auth = authorize(req, {
@@ -83,6 +89,18 @@ export class Gateway {
       if (!auth.ok) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
+        return;
+      }
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      // Voice gets its own socket handler: binary frames there are audio, not
+      // event-log JSON, and the two must never share a connection.
+      if (path === VOICE_PATH) {
+        if (!this.d.voice?.enabled) {
+          socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        this.voiceWss!.handleUpgrade(req, socket, head, (ws) => this.d.voice!.handleConnection(ws, req));
         return;
       }
       this.wss!.handleUpgrade(req, socket, head, (ws) => this.onSocket(ws, req));
@@ -111,7 +129,9 @@ export class Gateway {
 
   async stop(): Promise<void> {
     for (const c of this.wss?.clients ?? []) c.terminate();
+    for (const c of this.voiceWss?.clients ?? []) c.terminate();
     this.wss?.close();
+    this.voiceWss?.close();
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
   }
 
@@ -284,6 +304,10 @@ export class Gateway {
         byProject: runs.spendByProject(since),
       });
     }
+    if (p === '/voice') {
+      return json(res, 200, { ...(this.d.voice?.status() ?? { enabled: false }), latency: this.d.voice?.latency() ?? [] });
+    }
+
     if (p === '/schedules') {
       return json(res, 200, { jobs: this.d.scheduler?.list() ?? [] });
     }

@@ -64,6 +64,10 @@ describe('claude process wrapper', () => {
     const kinds: string[] = [];
     p.on('event', (e: { type: string }) => kinds.push(e.type));
     p.start();
+    // Interactive mode stays open for follow-ups, so the turn ends at `result`;
+    // closing stdin is what actually ends the process.
+    await new Promise((r) => p.on('event', (e: { type: string }) => e.type === 'result' && r(null)));
+    p.finishInput();
     await new Promise((r) => p.on('event', (e: { type: string }) => e.type === 'exit' && r(null)));
     assert.ok(kinds.includes('init'));
     assert.equal(kinds.filter((k) => k === 'text').length, 2);

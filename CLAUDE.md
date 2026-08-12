@@ -44,6 +44,7 @@ src/skills     SKILL.md loader        src/gateway    HTTP/WS/SSE + hook endpoint
 src/adapters   iMessage, Telegram     src/scheduler  cron + triggers
 src/computer   CDP, GUI, screen lock  src/service    launchd, worker isolation
 src/memory     non-project memory     src/backup     backup/restore
+src/voice      audio in/out, lanes, warm session
 public/        dashboard              skills/        starter skills
 ```
 
@@ -60,6 +61,14 @@ public/        dashboard              skills/        starter skills
   process. After granting either, the daemon must restart.
 - `config.json` must live outside every project path. Startup refuses to boot if
   a worker could write to its own policy.
+- The energy VAD's noise floor rises *glacially* and falls fast, on purpose. Any
+  meaningful upward adaptation lets the opening of an utterance raise the floor
+  above itself, and the rest of the sentence reads as silence.
+- `/voice` uses its own `WebSocketServer`. The dashboard socket fans the whole
+  event log out to every client; a voice socket that received that would be
+  parsing JSON where it expects PCM.
+- Voice never approves a gated action — confirmations escalate to text. Do not
+  "improve" this by adding a spoken yes.
 
 ## Board
 

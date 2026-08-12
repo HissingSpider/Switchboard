@@ -32,34 +32,30 @@ function promptFrom() {
 
 let prompt = interactive ? '' : promptFrom();
 
-async function readFirstInteractivePrompt() {
-  return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin });
-    rl.once('line', (line) => {
-      try {
-        const msg = JSON.parse(line);
-        resolve(msg.message?.content?.[0]?.text ?? '');
-      } catch {
-        resolve('');
-      }
-    });
-    // Guard against a test that never writes anything.
-    setTimeout(() => resolve(''), 3000);
+/**
+ * Interactive mode is a loop, not a single turn: the warm session used by the
+ * voice pipeline sends many prompts down one stdin and expects a `result` per
+ * turn. A single-shot fake would make every warm-session test pass for the
+ * wrong reason.
+ */
+function interactiveLoop() {
+  const rl = createInterface({ input: process.stdin });
+  let queue = Promise.resolve();
+  rl.on('line', (line) => {
+    let text = '';
+    try {
+      text = JSON.parse(line).message?.content?.[0]?.text ?? '';
+    } catch {
+      return;
+    }
+    queue = queue.then(() => respond(text));
+  });
+  rl.on('close', () => {
+    queue.then(() => process.exit(0));
   });
 }
 
-async function main() {
-  say({
-    type: 'system',
-    subtype: 'init',
-    session_id: sessionId,
-    model: 'fake-model',
-    tools: ['Read', 'Write', 'Bash'],
-    mcp_servers: [],
-  });
-
-  if (interactive) prompt = await readFirstInteractivePrompt();
-
+async function respond(prompt) {
   if (prompt.includes('SCENARIO:hang')) {
     await sleep(600_000);
     return;
@@ -121,7 +117,18 @@ async function main() {
     result: `done: ${prompt.slice(0, 80)}`,
     usage: { input_tokens: 100 * turns, output_tokens: 50 * turns },
   });
-  process.exit(0);
+  // One-shot mode ends with its only result; interactive mode waits for more.
+  if (!interactive) process.exit(0);
 }
 
-main();
+say({
+  type: 'system',
+  subtype: 'init',
+  session_id: sessionId,
+  model: 'fake-model',
+  tools: ['Read', 'Write', 'Bash'],
+  mcp_servers: [],
+});
+
+if (interactive) interactiveLoop();
+else respond(prompt);

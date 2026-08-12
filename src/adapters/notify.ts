@@ -108,6 +108,11 @@ export class NotificationService {
     return channel && threadId ? { channel, threadId } : undefined;
   }
 
+  /** Where proactive messages go when a run has no thread of its own. */
+  defaultTarget(): NotifyTarget | undefined {
+    return this.fallbackTarget();
+  }
+
   setDefaultTarget(channel: string, threadId: string): void {
     this.db
       .prepare(`INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES ('notify.default_target', ?, ?)`)

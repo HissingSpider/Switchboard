@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#0f1115" />
+    <title>Switchboard Voice</title>
+    <link rel="stylesheet" href="/app.css" />
+    <style>
+      /* This page is used one-handed, on a phone, at arm's length. Everything
+         is sized for a thumb and nothing needs precision. */
+      body { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+      header { flex: 0 0 auto; }
+      .voice-main { flex: 1; display: flex; flex-direction: column; padding: 12px 16px; gap: 12px; min-height: 0; }
+      .state { font-family: var(--mono); font-size: 12px; color: var(--dim); text-align: center; }
+      .state.live { color: var(--accent); }
+      .state.speaking { color: var(--ok); }
+      .transcript { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-bottom: 8px; }
+      .bubble { max-width: 82%; padding: 9px 13px; border-radius: 16px; font-size: 15px; line-height: 1.4; }
+      .bubble.you { align-self: flex-end; background: var(--accent); color: #0f1115; border-bottom-right-radius: 5px; }
+      .bubble.swb { align-self: flex-start; background: var(--panel-2); border-bottom-left-radius: 5px; }
+      .bubble.note { align-self: center; background: transparent; color: var(--dim); font-size: 12px; font-family: var(--mono); }
+      .controls { flex: 0 0 auto; display: flex; flex-direction: column; gap: 10px; align-items: center; padding-bottom: env(safe-area-inset-bottom, 8px); }
+      #talk {
+        width: 132px; height: 132px; border-radius: 50%;
+        background: var(--panel-2); border: 2px solid var(--line);
+        font-size: 15px; color: var(--text);
+        touch-action: none; user-select: none; -webkit-user-select: none;
+        transition: transform 0.08s ease, background 0.12s ease, border-color 0.12s ease;
+      }
+      #talk.held { background: var(--accent); color: #0f1115; border-color: var(--accent); transform: scale(0.95); }
+      #talk.openmic { border-color: var(--ok); }
+      #talk:disabled { opacity: 0.4; }
+      .meter { width: 132px; height: 4px; background: var(--panel-2); border-radius: 2px; overflow: hidden; }
+      .meter > div { height: 100%; width: 0%; background: var(--accent); transition: width 0.05s linear; }
+      .row.small { gap: 12px; font-size: 12px; color: var(--dim); }
+      .row.small label { display: flex; gap: 5px; align-items: center; }
+      #typed { width: 100%; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Voice</h1>
+      <div id="engines" class="summary">connecting…</div>
+      <nav><a href="/" style="color: var(--dim); font-size: 13px; text-decoration: none">Dashboard</a></nav>
+    </header>
+
+    <main class="voice-main">
+      <div id="state" class="state">idle</div>
+      <div id="transcript" class="transcript"></div>
+
+      <div class="controls">
+        <div class="meter"><div id="level"></div></div>
+        <button id="talk" disabled>Hold to talk</button>
+        <div class="row small">
+          <label><input type="checkbox" id="openmic" /> open mic</label>
+          <button id="stopbtn" type="button">Stop talking</button>
+        </div>
+        <form id="typeform" class="row" style="width: 100%">
+          <input id="typed" placeholder="…or type it" />
+        </form>
+      </div>
+    </main>
+
+    <script type="module" src="/voice.js"></script>
+  </body>
+</html>

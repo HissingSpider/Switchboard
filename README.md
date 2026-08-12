@@ -17,8 +17,8 @@ same run in full detail, live.
 
 ```
 you  ─┬─ iMessage (BlueBubbles) ─┐
-      └─ dashboard (localhost)  ─┴─► gateway ─► intent router ─► run registry ─► claude -p
-                                        │                            │
+      ├─ dashboard (localhost)   ├─► gateway ─► intent router ─► run registry ─► claude -p
+      └─ voice (phone browser)  ─┘      │                            │
                                         └──────── event log ◄────────┘
 ```
 
@@ -47,6 +47,7 @@ Then open http://127.0.0.1:7788.
 | Gateway | `src/gateway` | HTTP + WS + SSE, auth, hook endpoint, webhooks |
 | Channels | `src/adapters` | BlueBubbles in/out, Telegram, downsample, notification rules |
 | Scheduler | `src/scheduler` | 5-field cron, file/webhook/poll triggers |
+| Voice | `src/voice` | WS audio transport, VAD + endpointing, whisper.cpp STT, Piper/`say` TTS, latency lanes, warm session, wake word |
 | Computer use | `src/computer` | Chrome over CDP, macOS GUI + screenshots, headed session lock |
 | Ops | `src/service`, `src/backup`, `src/doctor` | launchd, worker isolation, backup/restore, preflight |
 
@@ -61,6 +62,47 @@ kill r-8k2wq                           SIGTERM by id
 tell r-8k2wq also update the readme    inject into a live run
 ok 3f9x  /  no 3f9x                    answer a confirmation
 ```
+
+## Voice
+
+Open `http://<mac-mini>:7788/voice.html` on a phone over Tailscale. Hold the
+button, talk, let go.
+
+Transport is a plain WebSocket carrying 16 kHz mono PCM16 — not WebRTC. On a
+tailnet there is nothing for WebRTC to solve, and skipping it removes a
+signalling server, a TURN dependency and a codec from the latency path.
+
+Three latency lanes, because one budget cannot fit every question:
+
+| lane | what it is | target | how |
+| --- | --- | --- | --- |
+| instant | status, cost, kill, stop, repeat | < 150 ms | answered from local state, no model at all |
+| query | anything you'd ask out loud | < 1.5 s | a resident `claude -p` that never cold-starts |
+| task | real work | ack < 300 ms | spawns a normal gated run, reports back by voice when it lands |
+
+Everything else exists to cover the gap: sentence-streamed TTS so the first
+sentence plays while the model writes the second, filler speech when a lane
+overruns its budget, and barge-in that cuts playback mid-word.
+
+Two rules that are not negotiable:
+
+- **A voice utterance never approves a gated action.** Recognition mishears
+  "no" as "go" often enough that it cannot be consent for something
+  irreversible. Confirmations are escalated to a text channel and answered
+  there.
+- **A spoken task is a real run** — same branch, same caps, same audit trail as
+  one you texted.
+
+TTS works with zero installs via macOS `say`. STT needs whisper.cpp:
+
+```bash
+brew install whisper-cpp
+mkdir -p ~/.switchboard/models && cd ~/.switchboard/models
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+`swb voice status` reports what's wired up; `swb voice install` prints every
+optional upgrade (Piper voices, openWakeWord).
 
 ## Safety model
 
@@ -95,6 +137,8 @@ swb service install        # launchd agent, restart on crash, caffeinate
 swb backup ~/Backups       # sqlite VACUUM INTO + config + agents + skills
 swb isolation script       # generates the non-admin worker-user setup
 swb computer perms         # Screen Recording / Accessibility state
+swb voice status           # engines, mic mode, client URL
+swb voice say "hello"      # hear the configured voice right now
 swb secret set bluebubbles # Keychain, never config.json
 ```
 

@@ -20,6 +20,7 @@ import { ImessageAdapter } from './adapters/imessage.js';
 import { TelegramAdapter } from './adapters/telegram.js';
 import { NotificationService } from './adapters/notify.js';
 import { Scheduler } from './scheduler/heartbeat.js';
+import { VoiceServer } from './voice/transport.js';
 import type { ChannelAdapter } from './adapters/types.js';
 
 const log = logger('switchboard');
@@ -124,6 +125,29 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
 
   const scheduler = new Scheduler(cfg, registry, events);
 
+  // Voice shares the run registry, the event log and the thread/session map
+  // with the text surfaces — a spoken task and a texted one are the same run.
+  const voice = new VoiceServer(cfg, cfg.voice, {
+    cfg,
+    registry,
+    runs,
+    sessions,
+    events,
+    confirms,
+    agents,
+    // A gated action can never be approved by voice, so it is pushed to
+    // whichever text channel is live instead.
+    escalate: async (text) => {
+      for (const a of adapters) {
+        if (!a.enabled) continue;
+        const target = notifications.defaultTarget();
+        if (!target || target.channel !== a.name) continue;
+        if (await a.send({ threadId: target.threadId, text })) return a.name;
+      }
+      return undefined;
+    },
+  });
+
   // --- gateway ---------------------------------------------------------
   const gateway = new Gateway({
     cfg,
@@ -138,6 +162,7 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
     pipeline,
     imessage,
     scheduler,
+    voice,
     token,
     hookToken: hookTok,
   });
@@ -145,12 +170,15 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   await gateway.start();
   for (const a of adapters) await a.start();
   scheduler.start();
+  // Deliberately not awaited: warming the model and the STT weights takes a
+  // few seconds and nothing else needs to wait for it.
+  void voice.prewarm();
 
   events.append({
     runId: null,
     kind: 'system.start',
     source: 'system',
-    summary: `Switchboard up on http://${cfg.gateway.host}:${cfg.gateway.port} — ${cfg.projects.length} projects, ${agents.all().length} agents, ${skills.all().length} skills`,
+    summary: `Switchboard up on http://${cfg.gateway.host}:${cfg.gateway.port} — ${cfg.projects.length} projects, ${agents.all().length} agents, ${skills.all().length} skills, voice ${cfg.voice.enabled ? 'on' : 'off'}`,
     data: { projects: cfg.projects.map((p) => p.name), imessage: cfg.imessage.enabled, telegram: cfg.telegram.enabled },
   });
   log.info('ready', { url: `http://${cfg.gateway.host}:${cfg.gateway.port}`, token: token.slice(0, 6) + '…' });
@@ -161,6 +189,7 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
     stopping = true;
     events.append({ runId: null, kind: 'system.stop', source: 'system', summary: 'Switchboard shutting down', data: {} });
     scheduler.stop();
+    await voice.stop();
     notifications.stop();
     agents.stopWatching();
     for (const a of adapters) await a.stop();

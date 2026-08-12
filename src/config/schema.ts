@@ -142,6 +142,24 @@ export interface TriggerConfig {
   enabled?: boolean;
 }
 
+export interface VoiceSettings {
+  enabled: boolean;
+  /** 'whisper' | 'macos'. Auto-detected when unset. */
+  sttEngine?: string;
+  whisperBinary?: string;
+  whisperModel?: string;
+  /** 'piper' | 'kokoro' | 'say'. Falls back to macOS `say`, which is always there. */
+  ttsEngine?: string;
+  ttsVoice?: string;
+  piperModel?: string;
+  /** Continuous listening instead of push-to-talk. */
+  openMic?: boolean;
+  /** Model for the resident conversational session. Small and fast beats smart here. */
+  model?: string;
+  /** openWakeWord model name for hands-free. Off when unset. */
+  wakeWord?: string;
+}
+
 export interface SwitchboardConfig {
   /** Root for the sqlite db, artifacts and logs. */
   dataDir: string;
@@ -166,6 +184,7 @@ export interface SwitchboardConfig {
   workerMcpSet: string;
   imessage: ImessageConfig;
   telegram: TelegramConfig;
+  voice: VoiceSettings;
   notifications: NotificationRule[];
   heartbeats: HeartbeatJob[];
   triggers: TriggerConfig[];
@@ -226,6 +245,7 @@ export const DEFAULT_CONFIG: SwitchboardConfig = {
   workerMcpSet: 'worker',
   imessage: { enabled: false, allowlist: [], webhookPath: '/hooks/bluebubbles' },
   telegram: { enabled: false, allowlist: [] },
+  voice: { enabled: true, openMic: false, ttsVoice: 'Samantha' },
   notifications: [
     { on: ['run.finished', 'run.failed'], action: 'push' },
     { on: ['action.confirm_requested'], action: 'push' },
