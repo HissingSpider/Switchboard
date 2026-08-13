@@ -46,6 +46,8 @@ src/computer   CDP, GUI, screen lock  src/service    launchd, worker isolation
 src/memory     non-project memory     src/backup     backup/restore
 src/voice      audio in/out, lanes, warm session
 src/net        reachability (tailnet vs LAN vs loopback)
+src/investigate entity map, health manifests, diagnosis loop
+src/queue      DeerDawn board worker      src/vault      Obsidian narrative store
 public/        dashboard              skills/        starter skills
 ```
 
@@ -80,6 +82,21 @@ public/        dashboard              skills/        starter skills
   publish, push or delete.
 - `display: inline-block` beats the `hidden` attribute. Anything with an
   explicit display needs its own `[hidden] { display: none }`.
+- Diagnosis and repair are separate lanes on purpose. The `investigate` profile
+  sets `haltOnDeny`, so a read-only run stops on its first write attempt rather
+  than quietly continuing without the step it needed.
+- A fix is verified by re-running the originating check *here*, not by believing
+  the run's own summary. `investigations.verifyFix` is what makes "fixed" mean
+  something.
+- The queue claims a card on the board *before* submitting the run. A crashed
+  daemon must leave a card visibly stuck in progress, never silently back in the
+  backlog for a second worker.
+- The queue also refuses to re-claim a card it finished this session. If a
+  `move` to done silently fails, the card stays in the backlog and would
+  otherwise be run again on every poll, forever, at real cost.
+- Vault refs are relative and must stay inside the write subfolder. An absolute
+  path is refused rather than reinterpreted — a write landing somewhere other
+  than where it was aimed is worse than one that fails.
 
 ## Board
 

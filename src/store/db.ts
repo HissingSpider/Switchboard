@@ -185,6 +185,39 @@ CREATE TABLE IF NOT EXISTS kv (
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
   // A run can be scoped to one skill, which pins it to that skill's manifest.
   { version: 2, sql: `ALTER TABLE runs ADD COLUMN skill TEXT;` },
+  {
+    version: 3,
+    sql: `
+CREATE TABLE IF NOT EXISTS investigations (
+  id          TEXT PRIMARY KEY,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  question    TEXT NOT NULL,
+  project     TEXT,
+  status      TEXT NOT NULL,          -- open|answered|blocked|abandoned
+  channel     TEXT,
+  thread_id   TEXT,
+  run_id      TEXT,
+  step        INTEGER NOT NULL DEFAULT 0,
+  answer      TEXT,
+  /** The check that exposed the problem, so a fix can be held to it. */
+  origin_check TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inv_status ON investigations(status);
+
+CREATE TABLE IF NOT EXISTS findings (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation TEXT NOT NULL,
+  ts          TEXT NOT NULL,
+  step        INTEGER NOT NULL,
+  kind        TEXT NOT NULL,          -- observation|hypothesis|ruled_out|cause|blocked
+  text        TEXT NOT NULL,
+  evidence    TEXT,
+  vault_path  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_findings_inv ON findings(investigation, id);
+`,
+  },
 ];
 
 export function openDb(path: string): Db {

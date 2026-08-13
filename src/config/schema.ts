@@ -40,6 +40,13 @@ export interface PermissionProfile {
   fallback: ActionTier;
   /** Passed to `claude --permission-mode`. */
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
+  /**
+   * Stop the whole run on the first denial instead of letting it carry on
+   * without the tool. Read-only investigation wants this: a diagnosis that
+   * silently skipped the step it needed is worse than one that stops and says
+   * what it wanted to do.
+   */
+  haltOnDeny?: boolean;
 }
 
 export interface McpSet {
@@ -160,6 +167,55 @@ export interface VoiceSettings {
   wakeWord?: string;
 }
 
+export interface DeerDawnConfig {
+  enabled: boolean;
+  /** Project whose backlog Switchboard is allowed to pull work from. */
+  queueProjectId?: string;
+  /** MCP server name for DeerDawn inside the worker set. */
+  mcpServer?: string;
+  /** How often to look for new cards. Each poll costs a small model call. */
+  pollIntervalMs?: number;
+  /** Never run more than this many queued cards at once. */
+  maxConcurrentCards?: number;
+  /** Where a queued card's confirmations and results should land. */
+  notifyChannel?: string;
+  notifyThreadId?: string;
+  /** Only pull cards whose title starts with one of these markers. Empty = all. */
+  labelFilter?: string[];
+}
+
+export interface VaultConfig {
+  enabled: boolean;
+  /** Absolute path to the Obsidian vault. */
+  path?: string;
+  /** The only subfolder agents may write to. */
+  writeSubfolder?: string;
+  /** Commit vault changes after each write. */
+  git?: boolean;
+}
+
+export interface HealthCheckStep {
+  name: string;
+  /** Shell command, or an MCP-flavoured instruction the investigator follows. */
+  run?: string;
+  ask?: string;
+  /** Substring that must appear in the output for the step to pass. */
+  expect?: string;
+}
+
+export interface ProjectHealth {
+  project: string;
+  /** Where it runs — a URL, a Vercel project, a launchd label. */
+  deployTarget?: string;
+  /** Where errors show up — a PostHog project, a log path, a Sentry DSN name. */
+  errorSource?: string;
+  /** The three numbers that say whether it is healthy. */
+  keyMetrics?: string[];
+  repoPath?: string;
+  /** Ordered checks, cheapest first. */
+  checks?: HealthCheckStep[];
+}
+
 export interface SwitchboardConfig {
   /** Root for the sqlite db, artifacts and logs. */
   dataDir: string;
@@ -185,6 +241,12 @@ export interface SwitchboardConfig {
   imessage: ImessageConfig;
   telegram: TelegramConfig;
   voice: VoiceSettings;
+  deerdawn: DeerDawnConfig;
+  vault: VaultConfig;
+  /** Per-project health manifests, used by investigation runs. */
+  health: ProjectHealth[];
+  /** Path to the entity map: spoken concepts -> IDs, events, paths, tables. */
+  entityMapPath?: string;
   notifications: NotificationRule[];
   heartbeats: HeartbeatJob[];
   triggers: TriggerConfig[];
@@ -211,6 +273,18 @@ export const DEFAULT_PERMISSION_PROFILES: PermissionProfile[] = [
     deny: ['Bash(sudo *)'],
     fallback: 'confirm',
     permissionMode: 'default',
+  },
+  {
+    // Investigation: reads run without asking, and the first proposed write
+    // stops the run and reports rather than queueing a confirmation nobody
+    // asked for. Diagnosis and repair are separate decisions.
+    name: 'investigate',
+    allow: ['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'TodoWrite', 'Bash(git log*)', 'Bash(git diff*)', 'Bash(git status*)', 'Bash(git show*)', 'Bash(ls *)', 'Bash(cat *)', 'Bash(rg *)', 'Bash(tail *)', 'Bash(head *)', 'mcp__*__get*', 'mcp__*__list*', 'mcp__*__search*', 'mcp__*__read*', 'mcp__*__query*'],
+    confirm: [],
+    deny: ['Write', 'Edit', 'NotebookEdit', 'Bash(git commit*)', 'Bash(git push*)', 'Bash(rm *)', 'Bash(mv *)', 'Bash(npm install*)'],
+    fallback: 'deny',
+    permissionMode: 'plan',
+    haltOnDeny: true,
   },
   {
     name: 'readonly',
@@ -246,6 +320,10 @@ export const DEFAULT_CONFIG: SwitchboardConfig = {
   imessage: { enabled: false, allowlist: [], webhookPath: '/hooks/bluebubbles' },
   telegram: { enabled: false, allowlist: [] },
   voice: { enabled: true, openMic: false, ttsVoice: 'Samantha' },
+  deerdawn: { enabled: false, mcpServer: 'deerdawn', pollIntervalMs: 600_000, maxConcurrentCards: 1 },
+  vault: { enabled: false, writeSubfolder: 'switchboard', git: true },
+  health: [],
+  entityMapPath: '~/.switchboard/entities.json',
   notifications: [
     { on: ['run.finished', 'run.failed'], action: 'push' },
     { on: ['action.confirm_requested'], action: 'push' },

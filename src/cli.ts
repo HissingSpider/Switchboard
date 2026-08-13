@@ -22,6 +22,8 @@ import { pickTts, MacSayTts, TTS_INSTALL_HELP } from './voice/tts.js';
 import { WAKE_WORD_HELP } from './voice/wakeword.js';
 import { pcmToWav } from './voice/types.js';
 import { checkReachability, formatReachability, serveCommand } from './net/reachability.js';
+import { EntityRegistry } from './investigate/entities.js';
+import { Vault } from './vault/vault.js';
 import { boot } from './index.js';
 
 const out = (s: string): void => void process.stdout.write(`${s}\n`);
@@ -81,6 +83,13 @@ const HELP = `swb — Switchboard
   push key|list|test
   reach                       how a phone can actually reach this
   skills review|trust <name>|retire <name>|restore <name>
+  investigate <question>       read-only diagnosis (--project, --check)
+  investigations [n]           recent investigations
+  fix <id>                     turn an answered investigation into a fix
+  health [project]             run a project's check sequence
+  entities list|seed|gaps      the spoken-concept map
+  vault status|notes|read <ref>
+  queue status|poll
   backup [dir] [--artifacts]  |  restore <archive>
 `;
 
@@ -422,6 +431,98 @@ async function main(): Promise<void> {
       out(`wake:     ${cfg.voice.wakeWord ?? 'off (push to talk)'}`);
       out(`client:   http://${cfg.gateway.host}:${cfg.gateway.port}/voice.html`);
       if (!stt.available) out(`\n${WHISPER_INSTALL_HELP}`);
+      return;
+    }
+
+    // ---------------------------------------------------------- investigate
+    case 'investigate': {
+      const cfg = cfgOrDie();
+      const question = args.join(' ');
+      if (!question) return void die('usage: swb investigate <question>');
+      const body = (await api(cfg, '/api/investigations', {
+        method: 'POST',
+        body: JSON.stringify({ question, project: flags.project, originCheck: flags.check }),
+      })) as { investigation: { id: string } };
+      return void out(`${body.investigation.id} — read-only, the answer comes back when it has one`);
+    }
+
+    case 'investigations': {
+      const cfg = cfgOrDie();
+      const body = (await api(cfg, `/api/investigations?limit=${args[0] ?? 15}`)) as {
+        investigations: Array<{ id: string; status: string; question: string; answer: string | null; project: string | null }>;
+      };
+      for (const i of body.investigations) {
+        out(`${i.id} ${i.status.padEnd(9)} ${String(i.project ?? '-').padEnd(10)} ${i.question.slice(0, 60)}`);
+        if (i.answer) out(`         ${i.answer.split('\n')[0]?.slice(0, 90)}`);
+      }
+      return;
+    }
+
+    case 'fix': {
+      const cfg = cfgOrDie();
+      if (!args[0]) return void die('usage: swb fix <investigation-id>');
+      const body = (await api(cfg, `/api/investigations/${args[0]}/fix`, { method: 'POST' })) as { run?: { id: string } };
+      return void out(body.run ? `${body.run.id} — it must re-run the originating check before reporting success` : 'not an answered investigation');
+    }
+
+    case 'health': {
+      const cfg = cfgOrDie();
+      const project = args[0];
+      if (!project) {
+        for (const h of cfg.health) out(`${h.project.padEnd(14)} ${h.checks?.length ?? 0} checks  ${h.deployTarget ?? ''}`);
+        if (!cfg.health.length) out('no health manifests configured — add them under "health" in config.json');
+        return;
+      }
+      const body = (await api(cfg, `/api/health/${project}`, { method: 'POST' })) as { text: string };
+      return void out(body.text);
+    }
+
+    case 'entities': {
+      const cfg = cfgOrDie();
+      const registry = new EntityRegistry(cfg.entityMapPath ?? join(cfg.resolved.dataDir, 'entities.json'));
+      const sub = args[0] ?? 'list';
+      if (sub === 'seed') return void out(`wrote ${registry.seed()} — edit it, then \`swb entities gaps\``);
+      if (sub === 'gaps') {
+        const gaps = registry.gaps();
+        if (!gaps.length) return void out(`${registry.all().length} entities, none missing anything`);
+        for (const g of gaps) out(`${g.name.padEnd(24)} missing: ${g.missing.join(', ')}`);
+        return;
+      }
+      for (const e of registry.all()) out(`${e.name.padEnd(24)} ${e.aliases.slice(0, 3).join(', ')}`);
+      if (!registry.all().length) out(`no entity map at ${registry.path} — \`swb entities seed\``);
+      return;
+    }
+
+    case 'vault': {
+      const cfg = cfgOrDie();
+      const vault = new Vault(cfg.vault);
+      const sub = args[0] ?? 'status';
+      if (sub === 'notes') return void out(vault.ours().join('\n') || '(none yet)');
+      if (sub === 'read') {
+        if (!args[1]) return void die('usage: swb vault read <ref>');
+        const note = vault.read(args[1]);
+        return void (note ? out(note.body) : die('no such note'));
+      }
+      out(`enabled: ${vault.enabled}`);
+      if (vault.root) out(`root:    ${vault.root}`);
+      if (vault.writeRoot) out(`writes:  ${vault.writeRoot} (and nowhere else)`);
+      out(`notes:   ${vault.ours().length}`);
+      for (const p2 of vault.problems) out(`  ! ${p2}`);
+      return;
+    }
+
+    case 'queue': {
+      const cfg = cfgOrDie();
+      if (args[0] === 'poll') {
+        const body = (await api(cfg, '/api/queue/poll', { method: 'POST' })) as { claimed: number; skipped: string[] };
+        out(`claimed ${body.claimed}`);
+        for (const s2 of body.skipped) out(`  skipped: ${s2}`);
+        return;
+      }
+      const body = (await api(cfg, '/api/queue')) as { enabled: boolean; project?: string; inFlight: Array<{ card: { title: string }; runId: string }> };
+      out(`enabled: ${body.enabled}${body.project ? ` · queue project ${body.project}` : ''}`);
+      for (const c of body.inFlight) out(`  ${c.runId} ${c.card.title}`);
+      if (!body.inFlight.length) out('  nothing claimed');
       return;
     }
 

@@ -30,6 +30,11 @@ import type { PushService } from './push.js';
 import type { SkillStore } from '../store/skills.js';
 import { considerPromotion, grantTrusted, proposeTrusted } from '../skills/trust.js';
 import { checkReachability, serveCommand } from '../net/reachability.js';
+import type { InvestigationService } from '../investigate/loop.js';
+import type { EntityRegistry } from '../investigate/entities.js';
+import type { Vault } from '../vault/vault.js';
+import type { QueueWorker } from '../queue/worker.js';
+import { runChecks, healthFor, formatReport } from '../investigate/health.js';
 
 const log = logger('gateway');
 
@@ -61,6 +66,10 @@ export interface GatewayDeps {
   devices: DeviceStore;
   push: PushService;
   skillStore: SkillStore;
+  investigations: InvestigationService;
+  entities: EntityRegistry;
+  vault: Vault;
+  queue: QueueWorker;
   token: string;
   hookToken: string;
 }
@@ -445,6 +454,79 @@ export class Gateway {
       }
     }
 
+    // --------------------------------------------------- investigations
+    if (p === '/investigations' && method === 'GET') {
+      return json(res, 200, { investigations: this.d.investigations.list(Number(url.searchParams.get('limit') ?? 25)) });
+    }
+    if (p === '/investigations' && method === 'POST') {
+      const body = (await readJson(req)) as { question?: string; project?: string; originCheck?: string };
+      if (!body.question) return json(res, 400, { error: 'question is required' });
+      const inv = this.d.investigations.start({
+        question: body.question,
+        project: body.project,
+        channel: 'dashboard',
+        threadId: 'dashboard',
+        originCheck: body.originCheck,
+      });
+      return json(res, 201, { investigation: inv });
+    }
+    const invMatch = /^\/investigations\/([^/]+)(\/.*)?$/.exec(p);
+    if (invMatch) {
+      const inv = this.d.investigations.get(invMatch[1]!);
+      if (!inv) return json(res, 404, { error: 'no such investigation' });
+      const sub = invMatch[2] ?? '';
+      if (sub === '' && method === 'GET') {
+        return json(res, 200, { investigation: inv, findings: this.d.investigations.findings(inv.id) });
+      }
+      if (sub === '/fix' && method === 'POST') {
+        const run = await this.d.investigations.proposeFix(inv.id, { channel: 'dashboard', threadId: 'dashboard' });
+        return run ? json(res, 201, { run }) : json(res, 409, { error: 'only an answered investigation can be turned into a fix' });
+      }
+    }
+
+    // -------------------------------------------------------- health
+    if (p === '/health' && method === 'GET') {
+      return json(res, 200, { manifests: cfg.health });
+    }
+    const healthMatch = /^\/health\/([^/]+)$/.exec(p);
+    if (healthMatch && method === 'POST') {
+      const manifest = healthFor(cfg, healthMatch[1]!);
+      if (!manifest) return json(res, 404, { error: 'no health manifest for that project' });
+      const report = await runChecks(manifest);
+      return json(res, 200, { report, text: formatReport(report) });
+    }
+
+    // -------------------------------------------------------- entities
+    if (p === '/entities') {
+      return json(res, 200, { entities: this.d.entities.all(), gaps: this.d.entities.gaps(), path: this.d.entities.path });
+    }
+    if (p === '/entities/reload' && method === 'POST') {
+      return json(res, 200, { count: this.d.entities.reload() });
+    }
+
+    // ----------------------------------------------------------- vault
+    if (p === '/vault') {
+      return json(res, 200, { enabled: this.d.vault.enabled, problems: this.d.vault.problems, notes: this.d.vault.ours().slice(0, 200) });
+    }
+    if (p === '/vault/note' && method === 'GET') {
+      const ref = url.searchParams.get('ref');
+      if (!ref) return json(res, 400, { error: 'ref is required' });
+      try {
+        const note = this.d.vault.read(ref);
+        return note ? json(res, 200, { note }) : json(res, 404, { error: 'no such note' });
+      } catch (err) {
+        return json(res, 400, { error: (err as Error).message });
+      }
+    }
+
+    // ----------------------------------------------------------- queue
+    if (p === '/queue' && method === 'GET') {
+      return json(res, 200, this.d.queue.status());
+    }
+    if (p === '/queue/poll' && method === 'POST') {
+      return json(res, 200, await this.d.queue.poll());
+    }
+
     // ---------------------------------------------------- reachability
     if (p === '/reachability') {
       const report = await checkReachability(cfg.gateway);
@@ -519,7 +601,19 @@ export class Gateway {
     });
 
     if (verdict.tier === 'allow') return json(res, 200, { decision: 'allow', reason: verdict.reason });
-    if (verdict.tier === 'deny') return json(res, 200, { decision: 'deny', reason: verdict.reason });
+    if (verdict.tier === 'deny') {
+      // Investigation runs stop on the first denial rather than carrying on
+      // without the tool: a diagnosis that quietly skipped the step it needed
+      // is worse than one that stops and says what it wanted to do.
+      if (profile.haltOnDeny) {
+        this.d.registry.kill(runId, `halted: tried to ${tool} (${verdict.reason})`);
+        return json(res, 200, {
+          decision: 'deny',
+          reason: `${verdict.reason}. This run is read-only and has been stopped — report what you would change instead.`,
+        });
+      }
+      return json(res, 200, { decision: 'deny', reason: verdict.reason });
+    }
 
     // A confirmation is the one thing worth waking someone for, so it goes out
     // as a push as well as through the usual notification rules.

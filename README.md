@@ -50,6 +50,9 @@ Then open http://127.0.0.1:7788.
 | Voice | `src/voice` | WS audio transport, VAD + endpointing, whisper.cpp STT, Piper/`say` TTS, latency lanes, warm session, wake word |
 | Self-authoring | `src/skills` | Gap detection, dedup, capability manifests, sandbox enforcement, self-tests, trust ladder |
 | Phone | `src/gateway`, `public/` | Device pairing, Web Push (VAPID, no dev account), PWA + service worker, approval inbox |
+| Investigation | `src/investigate` | Entity map, health manifests, read-only diagnosis loop with resumable findings |
+| Queue | `src/queue` | Pulls cards off a DeerDawn board, claims them, writes outcomes back |
+| Vault | `src/vault` | Obsidian as the narrative store, writes confined to one subfolder |
 | Computer use | `src/computer` | Chrome over CDP, macOS GUI + screenshots, headed session lock |
 | Ops | `src/service`, `src/backup`, `src/doctor` | launchd, worker isolation, backup/restore, preflight |
 
@@ -154,6 +157,72 @@ and RFC 8291. Each device gets its own token, so a lost phone costs one
 revocation instead of a rotation. On iOS push only works from a Home
 Screen-installed PWA, which is why the manifest and service worker exist.
 
+## Diagnosis, separately from repair
+
+"Why are signups down?" is a different job from "fix signups", and running them
+together is how an agent ends up changing things it does not understand. So they
+are two lanes.
+
+An investigation runs under the `investigate` permission profile: reads go
+through without asking, and the **first proposed write stops the run** and makes
+it report what it would change instead. It works in checkpoints —
+
+```
+FINDING observation: signups dropped to zero at 03:00 UTC.
+FINDING ruled_out: the 02:40 deploy did not touch the signup path.
+FINDING cause: the migration adding users.locale never ran in production.
+ANSWER: signups have been failing since 03:00 because a migration never ran.
+```
+
+— so a run that hits a turn cap resumes from what is known rather than from the
+question. Ask and walk away; the answer comes back on whichever channel asked.
+
+Two things make the answers concrete rather than vague:
+
+- **The entity map** (`swb entities seed`) turns what you say out loud into what
+  the machine has to look at — "signup" becomes a PostHog event name, a repo
+  path, a table, and what normal looks like. Without it every investigation
+  re-derives the same twenty facts, badly.
+- **Health manifests** record the five facts per project: where it runs, where
+  errors show up, the three numbers that matter, where the code is, and what to
+  check in what order. `swb health <project>` runs that sequence, cheapest check
+  first, and stops at the first failure.
+
+`swb fix <investigation-id>` turns an answer into a repair run — and that run is
+held to the check that exposed the problem. Switchboard re-runs it itself
+afterwards, because a run's claim that it fixed something is not evidence.
+
+## Working a DeerDawn board
+
+Point Switchboard at a queue project and it becomes a worker on it: claim a card
+(board first, run second), turn its title into a prompt via `build_subagent_brief`,
+run it, and write the outcome back with the branch and diff stat.
+
+```jsonc
+"deerdawn": {
+  "enabled": true,
+  "queueProjectId": "project_…",
+  "labelFilter": ["[swb]"],      // only cards you have marked for it
+  "notifyChannel": "imessage",   // so a confirm-by-reply has somewhere to land
+  "notifyThreadId": "iMessage;-;+15550109999"
+}
+```
+
+A card titled `[swb] fix the flaky auth test` routes to the project registered as
+`swb`. A card naming a project that does not exist is moved to Blocked rather
+than run somewhere arbitrary.
+
+## The vault
+
+DeerDawn holds structured memory. An Obsidian vault holds the story — why a
+thing was built that way, what was tried and abandoned. Every substantive run
+and every finished investigation gets a prose note, git-committed, and the
+structured record gets a `vault:` pointer to it.
+
+Writes are confined to one subfolder by path check, not by instruction. Reads
+are pull, not scan: the vault is never searched for context, only read when a
+record explicitly points into it.
+
 ## Safety model
 
 Three tiers, enforced at the runner by a `PreToolUse` hook rather than by asking
@@ -189,6 +258,9 @@ swb isolation script       # generates the non-admin worker-user setup
 swb computer perms         # Screen Recording / Accessibility state
 swb voice status           # engines, mic mode, client URL
 swb voice say "hello"      # hear the configured voice right now
+swb investigate "why is X"  # read-only diagnosis, answer comes back later
+swb health <project>       # run the check sequence
+swb queue poll             # look for DeerDawn work now
 swb secret set bluebubbles # Keychain, never config.json
 ```
 

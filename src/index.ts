@@ -28,6 +28,11 @@ import { SkillStore } from './store/skills.js';
 import { detectGap, shouldAuthor, authorAndRetry, reconcileManifest } from './skills/authoring.js';
 import { considerPromotion } from './skills/trust.js';
 import { parseManifest } from './skills/manifest.js';
+import { EntityRegistry } from './investigate/entities.js';
+import { InvestigationService } from './investigate/loop.js';
+import { Vault } from './vault/vault.js';
+import { McpBridgeClient, NullDeerDawnClient } from './queue/deerdawn.js';
+import { QueueWorker } from './queue/worker.js';
 import type { ChannelAdapter } from './adapters/types.js';
 
 const log = logger('switchboard');
@@ -175,6 +180,106 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   });
   for (const a of adapters) a.onMessage = (msg) => pipeline.handle(msg);
 
+  // --- investigation, vault and the DeerDawn queue ----------------------
+  const entities = new EntityRegistry(cfg.entityMapPath ?? join(cfg.resolved.dataDir, 'entities.json'));
+  const vault = new Vault(cfg.vault);
+  const investigations = new InvestigationService(db, cfg, registry, runs, events, entities);
+  const queueClient = cfg.deerdawn.enabled ? new McpBridgeClient(cfg, cfg.deerdawn.mcpServer) : new NullDeerDawnClient();
+  const queue = new QueueWorker(cfg, queueClient, registry, runs, events, artifacts, db);
+
+  registry.on('finished', (rec) => {
+    // An investigation step feeding the next one, a fix being held to the check
+    // that found the problem, and the narrative note — in that order, because
+    // the note wants the verification result in it.
+    const inv = investigations.onRunFinished(rec);
+    void investigations
+      .verifyFix(rec)
+      .then((verification) => writeNarrative(rec, verification))
+      .then(() => (inv && inv.status !== 'open' ? writeInvestigationNote(inv.id) : undefined))
+      .catch((err: Error) => log.debug('post-run bookkeeping failed', { err: err.message }));
+    if (inv) log.info('investigation advanced', { id: inv.id, status: inv.status });
+  });
+
+  /** One prose note per substantive run, pointed at from the structured record. */
+  async function writeNarrative(rec: import('./store/runs.js').RunRecord, verification?: { verified: boolean; detail: string }): Promise<void> {
+    if (!vault.enabled || rec.status === 'queued') return;
+    // Chat and query runs are conversation, not history worth keeping.
+    if (rec.intent !== 'task') return;
+
+    const diff = artifacts.read(rec.id, 'changes.diff');
+    const body = [
+      `**${rec.status}** · ${rec.project ?? 'scratch'} · $${rec.costUsd.toFixed(3)} · ${rec.turns} turns`,
+      rec.branch ? `Branch: \`${rec.branch}\`` : '',
+      '',
+      '## Asked',
+      rec.prompt,
+      '',
+      '## What happened',
+      (rec.result ?? rec.error ?? 'No summary was produced.').trim(),
+      verification ? `
+## Verification
+The originating check ${verification.verified ? 'passes again' : 'still fails'}.
+
+\`\`\`
+${verification.detail}
+\`\`\`` : '',
+      diff ? `
+## Diff
+\`\`\`diff
+${diff.slice(0, 8000)}
+\`\`\`` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const ref = vault.refForRun(rec.id, rec.prompt);
+    const note = await vault.write(ref, `${rec.id}: ${rec.prompt.slice(0, 80)}`, body);
+    // The pointer is what makes this note findable later; without it the vault
+    // is write-only.
+    kvSet(db, `vault.run.${rec.id}`, `vault:${note.ref}`);
+    events.append({
+      runId: rec.id,
+      kind: 'artifact.saved',
+      source: 'vault',
+      summary: `wrote ${note.ref}`,
+      data: { vaultPath: `vault:${note.ref}` },
+    });
+  }
+
+  /**
+   * A finished investigation is the case where prose is worth more than the
+   * structured record: the answer only means anything alongside what was ruled
+   * out on the way to it.
+   */
+  async function writeInvestigationNote(id: string): Promise<void> {
+    if (!vault.enabled) return;
+    const inv = investigations.get(id);
+    if (!inv) return;
+    const findings = investigations.findings(id);
+    const body = [
+      `**${inv.status}** · ${inv.project ?? 'no project'}${inv.originCheck ? ` · check: \`${inv.originCheck}\`` : ''}`,
+      '',
+      '## Question',
+      inv.question,
+      '',
+      '## Answer',
+      inv.answer ?? '(none)',
+      '',
+      '## How it got there',
+      findings.length ? findings.map((f) => `- **${f.kind}** — ${f.text}${f.evidence ? `\n  \`${f.evidence.split('\n')[0]}\`` : ''}`).join('\n') : '_no checkpoints recorded_',
+    ].join('\n');
+
+    const note = await vault.write(vault.refForInvestigation(id, inv.question), `${id}: ${inv.question.slice(0, 80)}`, body);
+    kvSet(db, `vault.investigation.${id}`, `vault:${note.ref}`);
+    events.append({
+      runId: inv.runId,
+      kind: 'artifact.saved',
+      source: 'vault',
+      summary: `wrote ${note.ref}`,
+      data: { vaultPath: `vault:${note.ref}`, investigation: id },
+    });
+  }
+
   const scheduler = new Scheduler(cfg, registry, events);
 
   // Voice shares the run registry, the event log and the thread/session map
@@ -218,6 +323,10 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
     devices,
     push,
     skillStore,
+    investigations,
+    entities,
+    vault,
+    queue,
     token,
     hookToken: hookTok,
   });
@@ -225,6 +334,8 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   await gateway.start();
   for (const a of adapters) await a.start();
   scheduler.start();
+  await queue.reconcile().then((n) => n && log.info('released orphaned queue cards', { n }));
+  queue.start();
   // Deliberately not awaited: warming the model and the STT weights takes a
   // few seconds and nothing else needs to wait for it.
   void voice.prewarm();
@@ -244,6 +355,7 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
     stopping = true;
     events.append({ runId: null, kind: 'system.stop', source: 'system', summary: 'Switchboard shutting down', data: {} });
     scheduler.stop();
+    queue.stop();
     await voice.stop();
     notifications.stop();
     agents.stopWatching();

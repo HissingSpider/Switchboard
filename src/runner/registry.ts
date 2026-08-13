@@ -31,6 +31,8 @@ export interface SubmitRunInput {
   parentRunId?: string;
   /** Pin the run to one skill's capability manifest. */
   skill?: string;
+  /** Override the permission profile — how investigation runs become read-only. */
+  permissionProfile?: string;
 }
 
 export interface ActiveRun {
@@ -63,6 +65,8 @@ export class RunRegistry extends EventEmitter {
   private readonly active = new Map<string, ActiveRun>();
   private readonly queue: string[] = [];
   private readonly projectLocks = new Set<string>();
+  /** Per-run permission profile overrides, set at submit time. */
+  private readonly profileOverrides = new Map<string, string>();
   private readonly hook: { scriptPath: string; settingsPath: string };
   private sweeper: NodeJS.Timeout | null = null;
 
@@ -143,6 +147,8 @@ export class RunRegistry extends EventEmitter {
       data: { project: project?.name, agent: agent?.name, taskClass, intent: record.intent, channel: record.channel },
     });
 
+    if (input.permissionProfile) this.profileOverrides.set(id, input.permissionProfile);
+
     this.queue.push(id);
     queueMicrotask(() => void this.drain());
     return record;
@@ -181,7 +187,8 @@ export class RunRegistry extends EventEmitter {
     const workdir = record.projectPath ?? this.cfg.resolved.scratchDir;
     mkdirSync(workdir, { recursive: true });
 
-    const permissionProfileName = agent?.permissionProfile ?? project?.permissionProfile ?? exec.defaultPermissionProfile;
+    const permissionProfileName =
+      this.profileOverrides.get(record.id) ?? agent?.permissionProfile ?? project?.permissionProfile ?? exec.defaultPermissionProfile;
     const permProfile = profileFor(this.cfg, permissionProfileName);
 
     if (record.project) this.projectLocks.add(record.project);
@@ -371,6 +378,7 @@ export class RunRegistry extends EventEmitter {
     if (!this.active.has(id)) return;
     if (run.questionTimer) clearTimeout(run.questionTimer);
     this.active.delete(id);
+    this.profileOverrides.delete(id);
     if (run.record.project) this.projectLocks.delete(run.record.project);
 
     const current = this.runs.get(id);
