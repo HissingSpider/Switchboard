@@ -2,7 +2,7 @@
 // used for things that aren't in the event log (history, cost, config).
 
 const $ = (sel) => document.querySelector(sel);
-const state = { runs: [], selected: null, events: [], projects: [], agents: [] };
+const state = { runs: [], selected: null, events: [], projects: [], agents: [], verbose: false };
 
 /** A paired device holds its own token; on the Mac Mini itself there is none
  *  and loopback is trusted. */
@@ -93,26 +93,124 @@ async function selectRun(id) {
     `<b>${run.id}</b> <span class="dim">${run.status} · ${run.project ?? 'scratch'} · ${run.agent ?? 'default'} · ${run.taskClass} · ${run.turns} turns · $${run.costUsd.toFixed(3)}</span>` +
     (run.branch ? ` <span class="dim">· ${esc(run.branch)}</span>` : '') +
     (hasDiff ? ` <button id="showdiff">diff</button>` : '') +
+    ` <button id="verbose">${state.verbose ? 'hide detail' : 'show detail'}</button>` +
     (children?.length ? ` <span class="dim">· ${children.length} child run(s)</span>` : '');
   if (hasDiff) $('#showdiff').onclick = () => showDiff(run.id);
+  $('#verbose').onclick = () => {
+    state.verbose = !state.verbose;
+    $('#verbose').textContent = state.verbose ? 'hide detail' : 'show detail';
+    renderEvents();
+  };
 
   $('#followup').hidden = !(run.status === 'running' || run.status === 'queued');
   renderEvents();
   await refreshRuns();
 }
 
-function renderEvents() {
-  $('#events').innerHTML = state.events
-    .map(
-      (e) => `<div class="ev k-${e.kind.replace('.', '-')}">
-        <span class="t">${time(e.ts)}</span>
-        <span class="k">${esc(e.kind)}</span>
-        <span class="s">${esc(e.summary)}</span>
-      </div>`,
-    )
+/**
+ * Minimal markdown, applied after escaping so it can never inject markup.
+ * Covers what a model actually emits in a reply — fences, inline code, bold,
+ * lists — and deliberately nothing else.
+ */
+function md(text) {
+  const blocks = [];
+  let out = esc(text)
+    // Fenced code first, held aside so nothing else rewrites its contents.
+    .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      blocks.push(`<pre class="code"><code>${code.replace(/\n$/, '')}</code></pre>`);
+      return `&lt;&lt;block:${blocks.length - 1}&gt;&gt;`;
+    })
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+  out = out
+    .split(/\n{2,}/)
+    .map((para) => {
+      const lines = para.split('\n').filter(Boolean);
+      if (!lines.length) return '';
+      if (lines.every((l) => /^\s*[-*]\s+/.test(l))) {
+        return `<ul>${lines.map((l) => `<li>${l.replace(/^\s*[-*]\s+/, '')}</li>`).join('')}</ul>`;
+      }
+      if (lines.every((l) => /^\s*\d+[.)]\s+/.test(l))) {
+        return `<ol>${lines.map((l) => `<li>${l.replace(/^\s*\d+[.)]\s+/, '')}</li>`).join('')}</ol>`;
+      }
+      return `<p>${lines.join('<br>')}</p>`;
+    })
     .join('');
+
+  // Must match the sentinel emitted above and nothing else. A bare \d+ here
+  // rewrites every number in the prose into `undefined`.
+  return out.replace(/&lt;&lt;block:(\d+)&gt;&gt;/g, (_, i) => blocks[Number(i)] ?? '');
+}
+
+/** Machinery rather than conversation. Hidden unless you ask for detail. */
+const NOISE = new Set(['usage.update', 'agent.thinking', 'tool.result', 'run.progress', 'notify.sent', 'notify.suppressed', 'message.out']);
+
+const TOOL_ICON = { Read: '□', Write: '✎', Edit: '✎', Bash: '›', Grep: '⌕', Glob: '⌕', WebFetch: '↗', WebSearch: '⌕', Task: '⌥' };
+
+const shortPath = (t) => String(t ?? '').replace(/^\/Users\/[^/]+\//, '~/');
+
+function renderEvents() {
   const box = $('#events');
-  box.scrollTop = box.scrollHeight;
+  const stuck = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  const visible = state.events.filter((e) => state.verbose || !NOISE.has(e.kind));
+
+  let lastMinute = '';
+  const rows = visible.map((e) => {
+    const minute = new Date(e.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const stamp = minute === lastMinute ? '' : `<div class="when">${minute}</div>`;
+    lastMinute = minute;
+    return stamp + renderEvent(e);
+  });
+
+  box.innerHTML = rows.join('') || '<div class="empty">nothing yet</div>';
+  if (stuck) box.scrollTop = box.scrollHeight;
+}
+
+function renderEvent(e) {
+  const d = e.data ?? {};
+  switch (e.kind) {
+    case 'agent.text':
+      return `<div class="say">${md(d.text ?? e.summary)}</div>`;
+    case 'agent.question':
+      return `<div class="say asking">${md(d.text ?? e.summary)}</div>`;
+
+    case 'tool.use': {
+      const icon = TOOL_ICON[d.tool] ?? '·';
+      const detail = shortPath(d.tool === 'Bash' ? d.input?.command : (d.input?.file_path ?? d.input?.url ?? d.input?.pattern ?? ''));
+      return `<div class="act"><span class="ic">${icon}</span><span class="tool">${esc(d.tool ?? '')}</span><span class="arg">${esc(detail)}</span></div>`;
+    }
+
+    case 'action.gated': {
+      if (d.tier === 'allow') return `<div class="act sub"><span class="ic">✓</span><span class="tool"></span><span class="arg">allowed ${esc(d.tool ?? '')}</span></div>`;
+      return `<div class="note ${d.tier === 'deny' ? 'bad' : 'warn'}">${d.tier === 'deny' ? 'blocked' : 'needs approval'}: ${esc(d.tool ?? '')} — ${esc(String(d.reason ?? ''))}</div>`;
+    }
+
+    case 'action.confirm_requested':
+      return `<div class="note warn">${esc(e.summary)}</div>`;
+    case 'action.confirm_answered':
+    case 'action.denied':
+      return `<div class="note">${esc(e.summary)}</div>`;
+
+    case 'run.queued':
+    case 'run.started':
+    case 'git.branch':
+      return `<div class="rule"><span>${esc(e.summary)}</span></div>`;
+    case 'run.finished':
+      return `<div class="rule ok"><span>${esc(e.summary)}</span></div>`;
+    case 'run.failed':
+    case 'run.killed':
+    case 'run.stuck':
+    case 'system.error':
+      return `<div class="rule bad"><span>${esc(e.summary)}</span></div>`;
+
+    case 'git.diff':
+    case 'artifact.saved':
+      return `<div class="note">${esc(e.summary)}</div>`;
+
+    default:
+      return `<div class="act sub"><span class="ic">·</span><span class="tool">${esc(e.kind)}</span><span class="arg">${esc(e.summary.slice(0, 160))}</span></div>`;
+  }
 }
 
 // ------------------------------------------------------------------- SSE

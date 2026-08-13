@@ -760,7 +760,16 @@ export class Gateway {
       res.writeHead(404, { 'content-type': 'text/plain' });
       return void res.end('not found');
     }
-    res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
+    // No caching for the app shell. This is a local, single-user app served
+    // from disk, so there is nothing to gain — and a stale app.js after an
+    // edit looks exactly like a change that did not work, which costs far more
+    // than the bytes ever saved.
+    const ext = extname(file);
+    const revalidate = ['.html', '.js', '.css', '.webmanifest'].includes(ext);
+    res.writeHead(200, {
+      'content-type': MIME[ext] ?? 'application/octet-stream',
+      'cache-control': revalidate ? 'no-store, must-revalidate' : 'public, max-age=86400',
+    });
     res.end(readFileSync(file));
   }
 }

@@ -14,7 +14,7 @@
  * would show a finished run as still going, or hide one that needs approval.
  */
 
-const SHELL_CACHE = 'swb-shell-v1';
+const SHELL_CACHE = 'swb-shell-v2';
 const SHELL = ['/', '/app.css', '/app.js', '/icon-192.png', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
@@ -44,6 +44,8 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     fetch(event.request)
       .then((response) => {
+        // Cached only as an offline fallback — the network answer always wins
+        // while there is one, so an edit is never hidden behind a stale copy.
         if (response.ok && SHELL.includes(url.pathname)) {
           const copy = response.clone();
           caches.open(SHELL_CACHE).then((cache) => cache.put(event.request, copy));
