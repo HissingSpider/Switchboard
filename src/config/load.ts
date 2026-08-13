@@ -72,7 +72,9 @@ export function validate(cfg: SwitchboardConfig): string[] {
   if (cfg.caps.maxCostUsd <= 0) problems.push('caps.maxCostUsd must be > 0');
   if (cfg.maxConcurrentRuns <= 0) problems.push('maxConcurrentRuns must be > 0');
   if (cfg.gateway.port < 1 || cfg.gateway.port > 65535) problems.push('gateway.port out of range');
-  if (cfg.imessage.enabled && !cfg.imessage.serverUrl) problems.push('imessage.enabled but imessage.serverUrl is unset');
+  if (cfg.imessage.enabled && cfg.imessage.mode === 'bluebubbles' && !cfg.imessage.serverUrl) {
+    problems.push('imessage.mode is "bluebubbles" but imessage.serverUrl is unset');
+  }
   if (cfg.imessage.enabled && cfg.imessage.allowlist.length === 0) {
     problems.push('imessage.enabled with an empty allowlist — that would accept texts from anyone');
   }

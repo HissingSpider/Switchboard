@@ -11,6 +11,8 @@ import { SkillRegistry } from '../skills/loader.js';
 import { parseCron } from '../scheduler/cron.js';
 import { checkReachability } from '../net/reachability.js';
 import { isValidVapidSubject } from '../gateway/push.js';
+import { NativeImessageAdapter, FULL_DISK_ACCESS_HELP } from '../adapters/imessage-native.js';
+import { join } from 'node:path';
 import { WhisperCppStt, WHISPER_INSTALL_HELP } from '../voice/stt.js';
 import { pickTts, TTS_INSTALL_HELP } from '../voice/tts.js';
 import { WakeWordDetector, WAKE_WORD_HELP } from '../voice/wakeword.js';
@@ -202,7 +204,22 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
   }
 
   // --- channels -------------------------------------------------------
-  if (cfg.imessage.enabled) {
+  if (cfg.imessage.enabled && (cfg.imessage.mode ?? 'native') === 'native') {
+    const adapter = new NativeImessageAdapter(cfg.imessage, { workDir: join(cfg.resolved.dataDir, 'imessage') });
+    const problem = adapter.problem;
+    add({
+      name: 'iMessage (receive)',
+      status: problem ? 'fail' : 'ok',
+      detail: problem ?? `watching ~/Library/Messages/chat.db, ${cfg.imessage.allowlist.length} allowlisted sender(s)`,
+      fix: problem ? FULL_DISK_ACCESS_HELP : undefined,
+    });
+    add({
+      name: 'iMessage (send)',
+      status: 'warn',
+      detail: 'Messages automation is granted on first send — macOS will prompt once',
+    });
+    await adapter.stop();
+  } else if (cfg.imessage.enabled) {
     try {
       const u = new URL('/api/v1/server/info', cfg.imessage.serverUrl);
       u.searchParams.set('password', resolveRef(cfg.imessage.passwordRef) ?? '');

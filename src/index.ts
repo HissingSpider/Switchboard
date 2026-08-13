@@ -18,6 +18,7 @@ import { MessagePipeline } from './router/pipeline.js';
 import { Gateway } from './gateway/server.js';
 import { gatewayToken, hookToken } from './gateway/auth.js';
 import { ImessageAdapter } from './adapters/imessage.js';
+import { NativeImessageAdapter } from './adapters/imessage-native.js';
 import { TelegramAdapter } from './adapters/telegram.js';
 import { NotificationService } from './adapters/notify.js';
 import { Scheduler } from './scheduler/heartbeat.js';
@@ -150,7 +151,15 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
 
   // --- channels --------------------------------------------------------
   const attachmentDir = join(cfg.resolved.dataDir, 'attachments');
-  const imessage = new ImessageAdapter(cfg.imessage, attachmentDir);
+  // Native drives Messages.app directly; BlueBubbles is there for anyone who
+  // wants typing indicators and reactions and is willing to run the server.
+  const useNativeImessage = (cfg.imessage.mode ?? 'native') === 'native';
+  const bluebubbles = new ImessageAdapter(cfg.imessage, attachmentDir);
+  const nativeImessage = new NativeImessageAdapter(cfg.imessage, {
+    pollMs: cfg.imessage.pollMs,
+    workDir: join(cfg.resolved.dataDir, 'imessage'),
+  });
+  const imessage = useNativeImessage ? nativeImessage : bluebubbles;
   const telegram = new TelegramAdapter(cfg.telegram, attachmentDir);
   const adapters: ChannelAdapter[] = [imessage, telegram];
 
@@ -317,7 +326,8 @@ ${diff.slice(0, 8000)}
     agents,
     skills,
     pipeline,
-    imessage,
+    // The webhook route only means anything for the BlueBubbles path.
+    imessage: useNativeImessage ? undefined : bluebubbles,
     scheduler,
     voice,
     devices,

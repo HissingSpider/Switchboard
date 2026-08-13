@@ -107,6 +107,14 @@ export interface GatewayConfig {
 
 export interface ImessageConfig {
   enabled: boolean;
+  /**
+   * 'native' drives Messages.app directly — no third-party app, one permission.
+   * 'bluebubbles' uses a BlueBubbles server, which adds typing indicators and
+   * reactions at the cost of another service to run.
+   */
+  mode?: 'native' | 'bluebubbles';
+  /** Poll interval for the native reader. */
+  pollMs?: number;
   /** BlueBubbles server base URL, e.g. http://127.0.0.1:1234 */
   serverUrl?: string;
   passwordRef?: string;
@@ -323,7 +331,7 @@ export const DEFAULT_CONFIG: SwitchboardConfig = {
   mcpSets: [],
   routerMcpSet: 'router',
   workerMcpSet: 'worker',
-  imessage: { enabled: false, allowlist: [], webhookPath: '/hooks/bluebubbles' },
+  imessage: { enabled: false, mode: 'native', pollMs: 1500, allowlist: [], webhookPath: '/hooks/bluebubbles' },
   telegram: { enabled: false, allowlist: [] },
   voice: { enabled: true, openMic: false, ttsVoice: 'Samantha' },
   deerdawn: { enabled: false, mcpServer: 'deerdawn', pollIntervalMs: 600_000, maxConcurrentCards: 1 },

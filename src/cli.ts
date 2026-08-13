@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import './core/warnings.js';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, cpSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, cpSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,7 @@ import { pcmToWav } from './voice/types.js';
 import { checkReachability, formatReachability, serveCommand } from './net/reachability.js';
 import { EntityRegistry } from './investigate/entities.js';
 import { Vault } from './vault/vault.js';
+import { NativeImessageAdapter, FULL_DISK_ACCESS_HELP } from './adapters/imessage-native.js';
 import { boot } from './index.js';
 
 const out = (s: string): void => void process.stdout.write(`${s}\n`);
@@ -90,6 +91,7 @@ const HELP = `swb — Switchboard
   entities list|seed|gaps      the spoken-concept map
   vault status|notes|read <ref>
   queue status|poll
+  imessage status|chats|allow <handle>
   backup [dir] [--artifacts]  |  restore <archive>
 `;
 
@@ -523,6 +525,41 @@ async function main(): Promise<void> {
       out(`enabled: ${body.enabled}${body.project ? ` · queue project ${body.project}` : ''}`);
       for (const c of body.inFlight) out(`  ${c.runId} ${c.card.title}`);
       if (!body.inFlight.length) out('  nothing claimed');
+      return;
+    }
+
+    // ------------------------------------------------------------- imessage
+    case 'imessage': {
+      const cfg = cfgOrDie();
+      const adapter = new NativeImessageAdapter(cfg.imessage, { workDir: join(cfg.resolved.dataDir, 'imessage') });
+      const sub = args[0] ?? 'status';
+
+      if (sub === 'chats') {
+        const chats = adapter.recentChats(15);
+        if (!chats.length) return void out(adapter.problem ?? 'no conversations found');
+        for (const c of chats) out(`${c.identifier.padEnd(24)} ${c.guid}`);
+        await adapter.stop();
+        return;
+      }
+
+      if (sub === 'allow') {
+        const handle = args[1];
+        if (!handle) return void die('usage: swb imessage allow <phone-or-email>');
+        const path = cfg.resolved.configFile;
+        const raw = JSON.parse(readFileSync(path, 'utf8')) as { imessage: { allowlist: string[]; enabled: boolean; mode?: string } };
+        if (!raw.imessage.allowlist.includes(handle)) raw.imessage.allowlist.push(handle);
+        raw.imessage.enabled = true;
+        raw.imessage.mode = raw.imessage.mode ?? 'native';
+        writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+        return void out(`allowlisted ${handle} — restart the daemon for it to take effect`);
+      }
+
+      out(`enabled:   ${cfg.imessage.enabled}`);
+      out(`mode:      ${cfg.imessage.mode ?? 'native'}`);
+      out(`allowlist: ${cfg.imessage.allowlist.join(', ') || '(empty — nobody can reach it)'}`);
+      out(`receive:   ${adapter.problem ?? 'ok'}`);
+      if (adapter.problem) out(`\n${FULL_DISK_ACCESS_HELP}`);
+      await adapter.stop();
       return;
     }
 
