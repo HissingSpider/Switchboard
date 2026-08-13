@@ -94,6 +94,14 @@ public/        dashboard              skills/        starter skills
 - The queue also refuses to re-claim a card it finished this session. If a
   `move` to done silently fails, the card stays in the backlog and would
   otherwise be run again on every poll, forever, at real cost.
+- `tailscale serve` terminates TLS and proxies to 127.0.0.1, so every tailnet
+  request *looks* like loopback. `isLoopback` therefore rejects anything
+  carrying a forwarding header — otherwise exposing the gateway to the tailnet
+  would expose it with no authentication at all.
+- `/pair.html` and `POST /api/devices/claim` are the one unauthenticated hole,
+  and it has to exist: a new phone has no token yet. It is safe because claiming
+  needs a single-use code that expires in five minutes and is only ever shown on
+  an already-trusted screen. Do not widen it.
 - Vault refs are relative and must stay inside the write subfolder. An absolute
   path is refused rather than reinterpreted — a write landing somewhere other
   than where it was aimed is worse than one that fails.

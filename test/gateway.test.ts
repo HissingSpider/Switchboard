@@ -376,3 +376,95 @@ describe('PWA assets', () => {
     assert.equal((await get('/pair.html')).status, 200);
   });
 });
+
+describe('proxied requests are not loopback', () => {
+  /**
+   * `tailscale serve` proxies to 127.0.0.1, so a tailnet request is
+   * indistinguishable from a local one by address alone. If loopback still
+   * skipped the token, exposing the gateway to the tailnet would expose it
+   * without any authentication at all.
+   */
+  const proxied = (headers: Record<string, string>): Promise<number> =>
+    new Promise((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: gw.port, path: '/api/status', headers }, (r) => {
+        r.resume();
+        resolve(r.statusCode ?? 0);
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+  test('a forwarded request with no credential is refused', async () => {
+    assert.equal(await proxied({ host: 'johns-mac-mini.tail20dab6.ts.net', 'x-forwarded-for': '100.64.0.9' }), 401);
+    assert.equal(await proxied({ host: 'phone.tail20dab6.ts.net', 'tailscale-user-login': 'someone@else.com' }), 401);
+  });
+
+  test('a forwarded request with a valid token is allowed', async () => {
+    assert.equal(
+      await proxied({
+        host: 'johns-mac-mini.tail20dab6.ts.net',
+        'x-forwarded-for': '100.64.0.9',
+        authorization: `Bearer ${TOKEN}`,
+      }),
+      200,
+    );
+  });
+
+  test('a genuinely local request still needs no token', async () => {
+    assert.equal(await proxied({ host: '127.0.0.1' }), 200);
+  });
+});
+
+describe('pairing bootstrap', () => {
+  /**
+   * These must go over raw http: undici silently drops a custom Host header, so
+   * a `fetch` here would arrive as an ordinary loopback request and prove
+   * nothing. A forwarding header is what makes it genuinely remote.
+   */
+  const remote = (path: string, method = 'GET', body?: string): Promise<{ status: number; text: string }> =>
+    new Promise((resolve, reject) => {
+      const headers: Record<string, string> = {
+        host: 'johns-mac-mini.tail20dab6.ts.net',
+        'x-forwarded-for': '100.64.0.9',
+      };
+      if (body) {
+        headers['content-type'] = 'application/json';
+        headers['content-length'] = String(Buffer.byteLength(body));
+      }
+      const req = httpRequest({ host: '127.0.0.1', port: gw.port, path, method, headers }, (r) => {
+        let text = '';
+        r.setEncoding('utf8');
+        r.on('data', (c) => (text += c));
+        r.on('end', () => resolve({ status: r.statusCode ?? 0, text }));
+      });
+      req.on('error', reject);
+      if (body) req.write(body);
+      req.end();
+    });
+
+  test('the pairing page and its assets are reachable without a token', async () => {
+    // A new phone has no credential yet; if these were gated, pairing over the
+    // tailnet would be impossible.
+    for (const path of ['/pair.html', '/app.css', '/manifest.webmanifest', '/icon-192.png']) {
+      assert.equal((await remote(path)).status, 200, path);
+    }
+  });
+
+  test('claiming works without a token but still needs a valid code', async () => {
+    const bad = await remote('/api/devices/claim', 'POST', JSON.stringify({ code: 'not-real', name: 'phone' }));
+    assert.equal(bad.status, 400);
+
+    const { code } = ctx.devices.createPairingCode();
+    const good = await remote('/api/devices/claim', 'POST', JSON.stringify({ code, name: 'phone' }));
+    assert.equal(good.status, 201);
+    assert.ok((JSON.parse(good.text) as { token?: string }).token);
+  });
+
+  test('the bootstrap hole is exactly that hole and nothing more', async () => {
+    // The dashboard, the API and the event stream all stay shut to a remote
+    // caller with no credential.
+    for (const path of ['/', '/app.js', '/api/status', '/api/runs', '/api/devices', '/events']) {
+      assert.equal((await remote(path)).status, 401, path);
+    }
+  });
+});

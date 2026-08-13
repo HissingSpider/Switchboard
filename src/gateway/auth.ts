@@ -41,9 +41,30 @@ export function bearerFrom(req: IncomingMessage): string | undefined {
   return url.searchParams.get('token') ?? undefined;
 }
 
+/** Headers that prove a request was forwarded rather than made locally. */
+const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'forwarded', 'tailscale-user-login'];
+
+/**
+ * True only for a request that genuinely originated on this machine.
+ *
+ * The socket address alone is not enough. `tailscale serve` terminates TLS and
+ * proxies to 127.0.0.1, so every request from every device on the tailnet looks
+ * like loopback — and loopback is the one case that skips the token. Any
+ * forwarding header means somebody else's request is wearing our address, and
+ * it has to authenticate like anyone else.
+ */
 export function isLoopback(req: IncomingMessage): boolean {
+  if (PROXY_HEADERS.some((h) => req.headers[h] !== undefined)) return false;
   const addr = req.socket.remoteAddress ?? '';
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+/** Who Tailscale says made this request, when it came through `tailscale serve`. */
+export function forwardedIdentity(req: IncomingMessage): { login?: string; via: string } | undefined {
+  const login = req.headers['tailscale-user-login'];
+  const forwardedFor = req.headers['x-forwarded-for'];
+  if (!login && !forwardedFor) return undefined;
+  return { login: typeof login === 'string' ? login : undefined, via: typeof forwardedFor === 'string' ? forwardedFor : 'proxy' };
 }
 
 export interface AuthOptions {

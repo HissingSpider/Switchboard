@@ -25,6 +25,7 @@ let playbackAt = 0;
 let playing = [];
 let openMic = false;
 let holding = false;
+let rejections = 0;
 
 // ------------------------------------------------------------------- UI
 
@@ -46,7 +47,13 @@ function bubble(text, who) {
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/voice?thread=voice:${deviceId()}`);
+  // A paired phone authenticates with its own token. It goes in the query
+  // string because a WebSocket handshake cannot carry custom headers, and it
+  // is required over the tailnet — only a genuinely local request skips it.
+  const params = new URLSearchParams({ thread: `voice:${deviceId()}` });
+  const token = localStorage.getItem('swb-token');
+  if (token) params.set('token', token);
+  ws = new WebSocket(`${proto}://${location.host}/voice?${params}`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
@@ -59,6 +66,7 @@ function connect() {
     const msg = JSON.parse(ev.data);
     switch (msg.type) {
       case 'ready':
+        ws.hadSession = true;
         ui.engines.textContent = `stt ${msg.sttReady ? 'ready' : 'MISSING'} · tts ${msg.ttsReady ? 'ready' : 'MISSING'}`;
         ui.talk.disabled = false;
         setState('ready');
@@ -100,8 +108,21 @@ function connect() {
   };
 
   ws.onclose = () => {
-    setState('disconnected — retrying');
     ui.talk.disabled = true;
+    // A socket that closed without ever reaching `ready` was refused at the
+    // handshake — almost always a rejected token. Retrying forever would just
+    // hide that, so say so and send the phone back to pairing.
+    if (!ws.hadSession) {
+      rejections++;
+      if (rejections >= 3) {
+        setState('not authorised — re-pair this device');
+        ui.engines.innerHTML = '<a href="/pair.html">pair this device</a>';
+        return;
+      }
+    } else {
+      rejections = 0;
+    }
+    setState('disconnected — retrying');
     setTimeout(connect, 2000);
   };
 }

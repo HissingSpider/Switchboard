@@ -215,6 +215,17 @@ export class Gateway {
       }
       if (path.startsWith('/hooks/trigger/') && req.method === 'POST') return await this.handleTrigger(req, res, path);
 
+      // The bootstrap surface. A brand-new phone has no token yet, so the
+      // pairing page and the claim endpoint have to be reachable without one —
+      // otherwise pairing is impossible over the tailnet. Nothing here leaks:
+      // the page is a static form, and claiming still requires a code that is
+      // single-use, expires in five minutes, and is only ever shown on a screen
+      // that is already trusted.
+      if (isBootstrapPath(path, req.method ?? 'GET')) {
+        if (path === '/api/devices/claim') return await this.api(req, res, url);
+        return this.static(res, path);
+      }
+
       const auth = this.authorizeRequest(req);
       if (!auth.ok) return json(res, auth.status, { error: auth.message });
 
@@ -710,6 +721,13 @@ export class Gateway {
     res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
     res.end(readFileSync(file));
   }
+}
+
+const BOOTSTRAP_ASSETS = new Set(['/pair.html', '/app.css', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png']);
+
+function isBootstrapPath(path: string, method: string): boolean {
+  if (path === '/api/devices/claim') return method === 'POST';
+  return BOOTSTRAP_ASSETS.has(path);
 }
 
 /** Push endpoints are third-party URLs; show the host, never the token in the path. */
