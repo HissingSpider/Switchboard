@@ -554,12 +554,29 @@ async function main(): Promise<void> {
         return void out(`allowlisted ${handle} — restart the daemon for it to take effect`);
       }
 
-      out(`enabled:   ${cfg.imessage.enabled}`);
-      out(`mode:      ${cfg.imessage.mode ?? 'native'}`);
-      out(`allowlist: ${cfg.imessage.allowlist.join(', ') || '(empty — nobody can reach it)'}`);
-      out(`receive:   ${adapter.problem ?? 'ok'}`);
-      if (adapter.problem) out(`\n${FULL_DISK_ACCESS_HELP}`);
+      // Ask the daemon, not ourselves: a CLI launched from a shell is
+      // attributed by macOS to the shell's app, so it reports no Full Disk
+      // Access even when the launchd-spawned daemon has it.
+      const live = (await api(cfg, '/api/imessage').catch(() => undefined)) as
+        | { enabled: boolean; mode: string; allowlist: string[]; receiving: boolean; problem?: string; recentChats: Array<{ identifier: string; guid: string }> }
+        | undefined;
       await adapter.stop();
+
+      if (!live) {
+        out('daemon not reachable — showing config only');
+        out(`enabled:   ${cfg.imessage.enabled}`);
+        out(`allowlist: ${cfg.imessage.allowlist.join(', ') || '(empty)'}`);
+        return;
+      }
+      out(`enabled:   ${live.enabled}`);
+      out(`mode:      ${live.mode}`);
+      out(`allowlist: ${live.allowlist.join(', ') || '(empty — nobody can reach it)'}`);
+      out(`receiving: ${live.receiving ? 'yes — watching for new messages' : `no — ${live.problem}`}`);
+      if (live.recentChats.length) {
+        out('\nrecent conversations:');
+        for (const c of live.recentChats.slice(0, 5)) out(`  ${c.identifier.padEnd(26)} ${c.guid}`);
+      }
+      if (!live.receiving) out(`\n${FULL_DISK_ACCESS_HELP}`);
       return;
     }
 

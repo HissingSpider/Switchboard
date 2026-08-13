@@ -20,6 +20,7 @@ import type { ConfirmService } from '../policy/confirm.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { SkillRegistry } from '../skills/loader.js';
 import type { ImessageAdapter } from '../adapters/imessage.js';
+import type { NativeImessageAdapter } from '../adapters/imessage-native.js';
 import type { MessagePipeline } from '../router/pipeline.js';
 import type { Scheduler } from '../scheduler/heartbeat.js';
 import { children } from '../agents/handoff.js';
@@ -70,6 +71,8 @@ export interface GatewayDeps {
   entities: EntityRegistry;
   vault: Vault;
   queue: QueueWorker;
+  /** The live native adapter, so its permission state can be reported honestly. */
+  imessageNative?: NativeImessageAdapter;
   token: string;
   hookToken: string;
 }
@@ -564,6 +567,23 @@ export class Gateway {
     if (p === '/reachability') {
       const report = await checkReachability(cfg.gateway);
       return json(res, 200, { ...report, serveCommand: serveCommand(cfg.gateway.port) });
+    }
+
+    // Asked of the daemon, not of the caller: macOS attributes a TCC grant to
+    // the process that holds it, and a CLI launched from a shell is attributed
+    // to the shell's app — so it reports "no access" while the launchd-spawned
+    // daemon has it. Only the daemon's own answer means anything.
+    if (p === '/imessage') {
+      const adapter = this.d.imessageNative;
+      return json(res, 200, {
+        enabled: cfg.imessage.enabled,
+        mode: cfg.imessage.mode ?? 'native',
+        allowlist: cfg.imessage.allowlist,
+        receiving: adapter ? !adapter.problem : false,
+        problem: adapter?.problem ?? (cfg.imessage.enabled ? undefined : 'imessage is disabled'),
+        lastError: adapter?.lastError ?? null,
+        recentChats: adapter && !adapter.problem ? adapter.recentChats(10) : [],
+      });
     }
 
     if (p === '/voice') {

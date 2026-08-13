@@ -98,6 +98,15 @@ public/        dashboard              skills/        starter skills
   request *looks* like loopback. `isLoopback` therefore rejects anything
   carrying a forwarding header — otherwise exposing the gateway to the tailnet
   would expose it with no authentication at all.
+- macOS attributes a TCC grant to the *responsible* process, which for anything
+  launched from a shell is the shell's app — not node. So a CLI check of Full
+  Disk Access reports "denied" while the launchd-spawned daemon has it. Ask the
+  daemon (`/api/imessage`), never the CLI's own process.
+- iMessage dates are nanoseconds since 2001 — past Number.MAX_SAFE_INTEGER for
+  anything recent, and node:sqlite throws rather than rounding. Cast to TEXT.
+- node:sqlite returns blobs as Uint8Array, whose `indexOf` cannot take a string.
+  Recent macOS puts the message body in `attributedBody`, so getting this wrong
+  makes every message arrive empty rather than failing loudly.
 - The VAPID `sub` is checked by the push providers, not just carried. Apple
   returns `BadJwtToken` for an implausible contact — which points at the
   signature, not at the one field that is actually wrong. `mailto:*@localhost`

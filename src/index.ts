@@ -328,6 +328,7 @@ ${diff.slice(0, 8000)}
     pipeline,
     // The webhook route only means anything for the BlueBubbles path.
     imessage: useNativeImessage ? undefined : bluebubbles,
+    imessageNative: useNativeImessage ? nativeImessage : undefined,
     scheduler,
     voice,
     devices,
