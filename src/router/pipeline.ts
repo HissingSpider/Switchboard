@@ -26,6 +26,16 @@ export interface PipelineDeps {
 }
 
 /**
+ * A thread may only produce this many runs in this window before it is assumed
+ * to be a loop rather than an enthusiastic human. Deliberately low: nobody
+ * legitimately sends six tasks in a minute, and the cost of being wrong is a
+ * five-minute pause, while the cost of not tripping is unbounded.
+ */
+const LOOP_MAX_RUNS = 5;
+const LOOP_WINDOW_MS = 60_000;
+const LOOP_COOLDOWN_MS = 5 * 60_000;
+
+/**
  * One inbound message, start to finish.
  *
  * Order matters: a confirmation reply must be checked before anything else, or
@@ -35,6 +45,9 @@ export interface PipelineDeps {
 export class MessagePipeline {
   /** Last project used per thread, so "and fix the test too" lands in the right repo. */
   private stickyProject = new Map<string, string>();
+  /** Run submissions per thread, for the loop breaker. */
+  private readonly recentRuns = new Map<string, number[]>();
+  private readonly trippedUntil = new Map<string, number>();
 
   constructor(private readonly d: PipelineDeps) {}
 
@@ -76,6 +89,11 @@ export class MessagePipeline {
     if (!prompt.trim()) return;
 
     if (routed.project) this.stickyProject.set(msg.threadId, routed.project.project.name);
+
+    // Last line of defence. Echo suppression handles the known loop; this
+    // catches every loop we have not thought of, including ones created by a
+    // channel we do not control.
+    if (!this.allowRun(msg.threadId)) return;
 
     try {
       const run = registry.submit({
@@ -181,6 +199,37 @@ export class MessagePipeline {
         ].filter(Boolean)));
       }
     }
+  }
+
+  /**
+   * Returns false when this thread has tripped the loop breaker. Trips once,
+   * says so once, and then stays quiet — a breaker that keeps announcing itself
+   * on every message is itself a way to spam someone.
+   */
+  private allowRun(threadId: string): boolean {
+    const now = Date.now();
+    const cooling = this.trippedUntil.get(threadId);
+    if (cooling && now < cooling) return false;
+    if (cooling && now >= cooling) {
+      this.trippedUntil.delete(threadId);
+      this.recentRuns.delete(threadId);
+    }
+
+    const times = (this.recentRuns.get(threadId) ?? []).filter((t) => now - t < LOOP_WINDOW_MS);
+    times.push(now);
+    this.recentRuns.set(threadId, times);
+    if (times.length <= LOOP_MAX_RUNS) return true;
+
+    this.trippedUntil.set(threadId, now + LOOP_COOLDOWN_MS);
+    this.d.events.append({
+      runId: null,
+      kind: 'system.error',
+      source: 'gateway',
+      summary: `loop breaker tripped on ${threadId}: ${times.length} runs in under a minute — pausing that thread for 5 minutes`,
+      data: { threadId, runsInWindow: times.length, cooldownMs: LOOP_COOLDOWN_MS },
+    });
+    void this.say(threadId, "That thread just tried to start six runs in a minute, so I've paused it for five minutes. If that wasn't you, something is echoing.");
+    return false;
   }
 
   private async say(threadId: string, text: string, attachments?: string[]): Promise<void> {

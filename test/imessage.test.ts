@@ -211,3 +211,82 @@ describe('reading new messages', () => {
     await adapter.stop();
   });
 });
+
+describe('echo suppression', () => {
+  /**
+   * The case that caused a real runaway: texting your own number. Apple
+   * delivers a self-addressed message back to this Mac as genuinely incoming —
+   * is_from_me is 0 and the sender is you — so nothing in the database
+   * distinguishes our own reply from a real message.
+   */
+  test('our own reply, echoed back by Apple, does not become a new message', async () => {
+    const db = fakeChatDb();
+    const adapter = adapterFor(db.path, ['+15550109999']);
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+
+    // Pretend we replied. The send itself will fail (no Messages here), but the
+    // body is recorded before the attempt, which is the point.
+    await adapter.send({ threadId: 'iMessage;-;+15550109999', text: 'on it — r-abc12' }).catch(() => false);
+
+    // Apple echoes it back as incoming from our own handle.
+    db.insert({ text: 'on it — r-abc12', sender: '+15550109999', chat: 'iMessage;-;+15550109999' });
+    await adapter.poll();
+    assert.deepEqual(seen, [], 'the echo must not be treated as a new instruction');
+
+    // A genuine message on the same thread still gets through.
+    db.insert({ text: 'status', sender: '+15550109999', chat: 'iMessage;-;+15550109999' });
+    await adapter.poll();
+    assert.deepEqual(seen, ['status']);
+    await adapter.stop();
+  });
+
+  test('whitespace differences do not defeat the match', async () => {
+    const db = fakeChatDb();
+    const adapter = adapterFor(db.path, ['+15550109999']);
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+
+    await adapter.send({ threadId: 'iMessage;-;+15550109999', text: 'done  in   4s' }).catch(() => false);
+    db.insert({ text: 'done in 4s', sender: '+15550109999', chat: 'iMessage;-;+15550109999' });
+    await adapter.poll();
+    assert.deepEqual(seen, []);
+    await adapter.stop();
+  });
+
+  test('the same text sent by a person later is not suppressed forever', async () => {
+    const db = fakeChatDb();
+    const adapter = adapterFor(db.path, ['+15550109999']);
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+
+    await adapter.send({ threadId: 'iMessage;-;+15550109999', text: 'status' }).catch(() => false);
+    db.insert({ text: 'status', sender: '+15550109999', chat: 'iMessage;-;+15550109999' });
+    await adapter.poll();
+    assert.deepEqual(seen, [], 'the immediate echo is suppressed');
+
+    // Suppression is keyed on the exact body, not on the thread, so a different
+    // message is unaffected even inside the window.
+    db.insert({ text: 'runs', sender: '+15550109999', chat: 'iMessage;-;+15550109999' });
+    await adapter.poll();
+    assert.deepEqual(seen, ['runs']);
+    await adapter.stop();
+  });
+
+  test('an echo on a different thread is not suppressed', async () => {
+    const db = fakeChatDb();
+    const adapter = adapterFor(db.path, ['+15550109999', '+15550100001']);
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(`${m.threadId}:${m.text}`);
+    await adapter.start();
+
+    await adapter.send({ threadId: 'iMessage;-;+15550109999', text: 'ping' }).catch(() => false);
+    db.insert({ text: 'ping', sender: '+15550100001', chat: 'iMessage;-;+15550100001' });
+    await adapter.poll();
+    assert.deepEqual(seen, ['iMessage;-;+15550100001:ping']);
+    await adapter.stop();
+  });
+});

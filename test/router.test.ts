@@ -241,3 +241,30 @@ describe('execution profiles', () => {
     assert.ok(assistant.maxTurns < coding.maxTurns);
   });
 });
+
+describe('failure diagnosis cannot be steered from outside', () => {
+  /**
+   * The run's result is written by the model in response to whatever someone
+   * texted in. Classifying on it means the word "unauthorized" in a message
+   * diagnoses expired credentials — and that halts the daemon. An inbound text
+   * must never be able to stop the system.
+   */
+  test('a run whose output mentions auth is not diagnosed as an auth failure', () => {
+    const run = { status: 'failed', exitCode: 1, error: null } as never;
+    const d = diagnose(run, '', 'I fixed the unauthorized error and the invalid api key handling in auth.ts');
+    assert.notEqual(d.kind, 'auth_expired');
+    assert.equal(d.halt, false, 'nothing a message can say should halt the daemon');
+  });
+
+  test('a real auth failure on stderr is still caught', () => {
+    const run = { status: 'failed', exitCode: 1, error: null } as never;
+    const d = diagnose(run, 'authentication_error: invalid api key', '');
+    assert.equal(d.kind, 'auth_expired');
+    assert.equal(d.halt, true);
+  });
+
+  test('credit exhaustion on stderr still halts', () => {
+    const run = { status: 'failed', exitCode: 1, error: null } as never;
+    assert.equal(diagnose(run, 'Your credit balance is too low', '').halt, true);
+  });
+});

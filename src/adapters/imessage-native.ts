@@ -29,6 +29,9 @@ const require = createRequire(import.meta.url);
  */
 const CHAT_DB = join(homedir(), 'Library', 'Messages', 'chat.db');
 
+/** How long a sent message stays recognisable as our own echo. */
+const ECHO_TTL_MS = 120_000;
+
 /** Apple's epoch is 2001-01-01; modern macOS stores nanoseconds since then. */
 const APPLE_EPOCH_MS = Date.UTC(2001, 0, 1);
 
@@ -150,6 +153,16 @@ export class NativeImessageAdapter implements ChannelAdapter {
   private lastRowId = 0;
   private readonly dbPath: string;
   private polling = false;
+  /**
+   * Bodies we sent recently, so we do not answer our own echo.
+   *
+   * Texting your own number is the case that breaks the obvious defence:
+   * Apple delivers a self-addressed message back to this Mac as genuinely
+   * incoming — `is_from_me` is 0 and the sender is you — so it is
+   * indistinguishable from a real message by any field in the database. The
+   * only thing that separates them is that we know what we just said.
+   */
+  private readonly recentlySent = new Map<string, number>();
   lastError: string | null = null;
 
   constructor(
@@ -263,6 +276,29 @@ export class NativeImessageAdapter implements ChannelAdapter {
     return delivered;
   }
 
+  /** Normalised so trivial whitespace differences do not defeat the match. */
+  private echoKey(threadId: string, text: string): string {
+    return `${threadId}\u0000${text.replace(/\s+/g, ' ').trim()}`;
+  }
+
+  private rememberSent(threadId: string, text: string): void {
+    const now = Date.now();
+    this.recentlySent.set(this.echoKey(threadId, text), now);
+    for (const [key, at] of this.recentlySent) {
+      if (now - at > ECHO_TTL_MS) this.recentlySent.delete(key);
+    }
+  }
+
+  private isOwnEcho(threadId: string, text: string): boolean {
+    const at = this.recentlySent.get(this.echoKey(threadId, text));
+    if (at === undefined) return false;
+    if (Date.now() - at > ECHO_TTL_MS) {
+      this.recentlySent.delete(this.echoKey(threadId, text));
+      return false;
+    }
+    return true;
+  }
+
   private toInbound(row: MessageRow): InboundMessage | undefined {
     const sender = row.sender ?? '';
     if (!allowlisted(this.cfg.allowlist, sender)) {
@@ -276,9 +312,15 @@ export class NativeImessageAdapter implements ChannelAdapter {
     const attachments = this.attachmentsFor(row.rowid);
     if (!text && !attachments.length) return undefined;
 
+    const threadId = row.chat_guid ?? sender;
+    if (text && this.isOwnEcho(threadId, text)) {
+      log.debug('ignored our own message echoed back', { threadId, text: text.slice(0, 60) });
+      return undefined;
+    }
+
     return {
       channel: 'imessage',
-      threadId: row.chat_guid ?? sender,
+      threadId,
       sender,
       text,
       attachments,
@@ -320,6 +362,10 @@ export class NativeImessageAdapter implements ChannelAdapter {
           `  send ${quote(msg.text)} to participant ${quote(target)} of svc`,
           'end tell',
         ].join('\n');
+
+    // Recorded before the send, not after: the echo can arrive while osascript
+    // is still returning.
+    this.rememberSent(target, msg.text);
 
     try {
       await exec('osascript', ['-e', script], { timeout: 20_000 });

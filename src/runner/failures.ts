@@ -106,12 +106,22 @@ export function classify(text: string): FailureKind {
   return 'unknown';
 }
 
-export function diagnose(run: RunRecord, stderr = '', result = ''): Diagnosis {
+/**
+ * Diagnose a failure from the process's own output only.
+ *
+ * Deliberately does NOT look at the run's result. That text is written by the
+ * model in response to whatever a person texted in, so classifying on it means
+ * a message containing the word "unauthorized" is diagnosed as expired
+ * credentials — and `auth_expired` halts the daemon. That turns any inbound
+ * message into a denial of service. stderr and our own error field are the only
+ * sources we control.
+ */
+export function diagnose(run: RunRecord, stderr = '', _result = ''): Diagnosis {
   if (run.status === 'killed') {
     const kind: FailureKind = /stuck/i.test(run.error ?? '') ? 'stuck' : 'killed';
     return { kind, ...REMEDIES[kind] };
   }
-  const kind = classify(`${stderr}\n${result}\n${run.error ?? ''}`);
+  const kind = classify(`${stderr}\n${run.error ?? ''}`);
   const base = REMEDIES[kind] ?? REMEDIES.unknown;
   return { kind: kind === 'unknown' && run.exitCode !== 0 ? 'crashed' : kind, ...base };
 }
@@ -133,7 +143,7 @@ export class FailureMonitor {
   inspect(run: RunRecord): Diagnosis | undefined {
     if (run.status === 'done') return undefined;
     const stderr = this.artifacts.read(run.id, 'stderr.log') ?? '';
-    const diagnosis = diagnose(run, stderr, run.result ?? '');
+    const diagnosis = diagnose(run, stderr);
 
     this.events.append({
       runId: run.id,
