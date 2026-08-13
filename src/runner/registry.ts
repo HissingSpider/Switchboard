@@ -5,7 +5,7 @@ import { findProject, profileFor, expandPath } from '../config/load.js';
 import type { AgentConfig, TaskClass } from '../config/schema.js';
 import { ClaudeProcess, type ClaudeEvent } from './claude.js';
 import { GitWrapper, isRepo, formatDiffStat } from './git.js';
-import { executionProfile, effectiveCaps } from './profiles.js';
+import { executionProfile, effectiveCaps, modelFor } from './profiles.js';
 import { resolveMcpSet, writeMcpConfig, setNameFor } from './mcp.js';
 import { installHook, HOOK_PATH } from './hook.js';
 import type { EventLog } from '../store/eventlog.js';
@@ -133,6 +133,9 @@ export class RunRegistry extends EventEmitter {
       projectPath: workdir,
       agent: agent?.name ?? null,
       taskClass,
+      // Resolved here rather than at launch: the lane is known now, and a run
+      // that starts after a config edit must run on the model it was priced at.
+      model: modelFor(this.cfg, { intent: input.intent, explicit: input.model, agent }) ?? null,
       intent: input.intent ?? 'task',
       channel: input.channel ?? null,
       threadId: input.threadId ?? null,
@@ -241,7 +244,7 @@ export class RunRegistry extends EventEmitter {
       bin: this.cfg.claudeBin,
       cwd: workdir,
       prompt: record.prompt,
-      model: agent?.model,
+      model: record.model ?? undefined,
       resumeSessionId: record.sessionId ?? undefined,
       maxTurns: caps.maxTurns,
       appendSystemPrompt: systemPrompt || undefined,

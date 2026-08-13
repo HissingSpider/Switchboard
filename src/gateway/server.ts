@@ -387,6 +387,7 @@ export class Gateway {
         monthSpendUsd: runs.monthSpend(),
         monthBudgetUsd: cfg.caps.monthlyBudgetUsd,
         byProject: runs.spendByProject(since),
+        byModel: runs.spendByModel(since),
       });
     }
     // ---------------------------------------------------------- devices

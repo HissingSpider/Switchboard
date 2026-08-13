@@ -112,7 +112,7 @@ async function selectRun(id, opts = {}) {
   const hasDiff = artifacts.some((a) => a.name === 'changes.diff');
   $('#runhead').innerHTML =
     `<button class="backbtn" id="backbtn">‹ Runs</button>` +
-    `<b>${run.id}</b> <span class="dim">${run.status} · ${run.project ?? 'scratch'} · ${run.agent ?? 'default'} · ${run.taskClass} · ${run.turns} turns · $${run.costUsd.toFixed(3)}</span>` +
+    `<b>${run.id}</b> <span class="dim">${run.status} · ${run.project ?? 'scratch'} · ${run.agent ?? 'default'} · ${run.taskClass} · ${esc(run.model ?? 'default model')} · ${run.turns} turns · $${run.costUsd.toFixed(3)}</span>` +
     (run.branch ? ` <span class="dim">· ${esc(run.branch)}</span>` : '') +
     (hasDiff ? ` <button id="showdiff">diff</button>` : '') +
     ` <button id="verbose">${state.verbose ? 'hide detail' : 'show detail'}</button>` +
@@ -389,8 +389,18 @@ async function loadCost() {
   $('#cost').innerHTML =
     `<h2>$${c.monthSpendUsd.toFixed(2)} <span class="dim">of $${c.monthBudgetUsd} this month</span></h2>
      <div class="bar ${pct >= 100 ? 'over' : ''}"><div style="width:${pct}%"></div></div>
+     <h3 class="section">By project</h3>
      <table><tr><th>project</th><th>runs</th><th>spend</th></tr>` +
     c.byProject.map((p) => `<tr><td>${esc(p.project)}</td><td class="mono">${p.runs}</td><td class="mono">$${Number(p.costUsd).toFixed(2)}</td></tr>`).join('') +
+    `</table>
+     <h3 class="section">By model</h3>
+     <p class="hint">Lanes pick the model: chat and read-only answers run cheap, real work runs on the default. If <code>(default)</code> owns the bill, something is routing everything to the top tier.</p>
+     <table><tr><th>model</th><th>runs</th><th>spend</th><th>avg</th></tr>` +
+    (c.byModel ?? [])
+      .map(
+        (m) => `<tr><td class="mono">${esc(m.model)}</td><td class="mono">${m.runs}</td><td class="mono">$${Number(m.costUsd).toFixed(2)}</td><td class="mono">$${(Number(m.costUsd) / Math.max(1, m.runs)).toFixed(3)}</td></tr>`,
+      )
+      .join('') +
     `</table>`;
 }
 

@@ -230,6 +230,38 @@ export interface ProjectHealth {
   checks?: HealthCheckStep[];
 }
 
+/**
+ * Which model each lane runs on.
+ *
+ * The router already sorts every message into chat, query or task before a
+ * process is spawned, and those three lanes differ by roughly 5x in what an
+ * answer is worth. Sending "ok" and "refactor the scheduler" to the same model
+ * is the single largest avoidable cost in the system.
+ *
+ * Values are passed straight to `claude --model`, so a tier alias (`haiku`,
+ * `sonnet`, `opus`) or a pinned id (`claude-sonnet-5`) both work. The aliases
+ * are the defaults because they track the current model in each tier; pin an id
+ * when a lane needs to stay on a known model.
+ *
+ * Unset means "whatever the CLI itself would pick" — which is what `task` does
+ * by default, because the top tier is the one place not to economise.
+ */
+export interface ModelsConfig {
+  /** Conversational reply. No repo, no tools. */
+  chat?: string;
+  /** Read-only answer. May read a repo, never writes. */
+  query?: string;
+  /** Real work: write access, a branch, a diff. */
+  task?: string;
+  /**
+   * Mechanical model calls that are not conversation at all — today the
+   * DeerDawn bridge, which calls one MCP tool and emits a fixed JSON shape.
+   * It runs on a timer whether or not there is work, so it is the one call
+   * whose cost is paid continuously rather than per request.
+   */
+  bridge?: string;
+}
+
 export interface SwitchboardConfig {
   /** Root for the sqlite db, artifacts and logs. */
   dataDir: string;
@@ -241,6 +273,8 @@ export interface SwitchboardConfig {
   claudeBin: string;
   /** Max runs executing at once across all projects. */
   maxConcurrentRuns: number;
+  /** Per-lane model selection. See ModelsConfig. */
+  models: ModelsConfig;
   gateway: GatewayConfig;
   caps: CapsConfig;
   projects: ProjectConfig[];
@@ -316,6 +350,9 @@ export const DEFAULT_CONFIG: SwitchboardConfig = {
   skillsDir: '~/.switchboard/skills',
   claudeBin: 'claude',
   maxConcurrentRuns: 3,
+  // `task` is deliberately unset: the lane that writes code is the one place
+  // where picking the cheaper model is a false economy.
+  models: { chat: 'haiku', query: 'sonnet', bridge: 'haiku' },
   gateway: { host: '127.0.0.1', port: 7788, trustedHosts: [] },
   caps: {
     maxTurns: 40,

@@ -218,6 +218,10 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE INDEX IF NOT EXISTS idx_findings_inv ON findings(investigation, id);
 `,
   },
+  // The model a run asked for. Recorded rather than re-derived because lane
+  // defaults change, and "what did this actually cost, and on what" has to stay
+  // answerable for runs that happened under the old config.
+  { version: 4, sql: `ALTER TABLE runs ADD COLUMN model TEXT;` },
 ];
 
 export function openDb(path: string): Db {

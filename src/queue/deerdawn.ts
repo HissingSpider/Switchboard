@@ -84,6 +84,9 @@ export class McpBridgeClient implements DeerDawnClient {
       bin: this.cfg.claudeBin,
       cwd: this.cfg.resolved.scratchDir,
       prompt: `${instruction}\n\n${JSON_CONTRACT}`,
+      // Calling one MCP tool and emitting a fixed JSON shape is not work that
+      // rewards a larger model, and this runs on a timer forever.
+      model: this.cfg.models?.bridge,
       maxTurns: 8,
       allowedTools: [`mcp__${this.server}__*`],
       mcpConfigPath,

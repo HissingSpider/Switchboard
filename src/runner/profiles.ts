@@ -1,4 +1,5 @@
 import type { TaskClass, SwitchboardConfig, AgentConfig } from '../config/schema.js';
+import type { Intent } from '../store/runs.js';
 
 /**
  * Execution profiles per task class. The class decides what a run is *shaped*
@@ -80,6 +81,24 @@ export function effectiveCaps(cfg: SwitchboardConfig, taskClass: TaskClass): { m
     maxWallMs: Math.round(cfg.caps.maxWallMs * p.capScale),
     idleTimeoutMs: cfg.caps.idleTimeoutMs,
   };
+}
+
+/**
+ * Which model this run gets, most specific wins.
+ *
+ * An explicit per-run model beats an agent's, an agent's beats the lane's, and
+ * an unset lane means the CLI picks — which is the right answer for `task`,
+ * where the cheaper model is a false economy.
+ *
+ * The lane is the axis rather than the task class because the class only exists
+ * once a run *is* a task: chat and query are both `assistant`, and they are
+ * exactly the two that should not be paying top-tier rates.
+ */
+export function modelFor(
+  cfg: SwitchboardConfig,
+  opts: { intent?: Intent; explicit?: string; agent?: AgentConfig },
+): string | undefined {
+  return opts.explicit ?? opts.agent?.model ?? cfg.models?.[opts.intent ?? 'task'];
 }
 
 export function resolveAgentProfile(cfg: SwitchboardConfig, agent?: AgentConfig): { taskClass: TaskClass; permissionProfile: string } {

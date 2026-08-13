@@ -31,6 +31,10 @@ reason — don't "fix" the imports back to `src/`.
   texted and typed back. Keep them short, unambiguous, prefix-resolvable.
 - **Prefer no dependency.** Cron, glob matching, frontmatter and the CLI flag
   parser are all hand-rolled and small. That is deliberate.
+- **The lane picks the model.** `config.models` maps chat/query/task (and the
+  DeerDawn `bridge`) onto `claude --model`. `task` is deliberately unset so real
+  work stays on the CLI's own default — the cheap tier is for the lanes where an
+  answer isn't worth much, not for the one that writes code.
 - Comments explain *why*, especially where the safe choice looks over-cautious.
   Don't narrate what the next line does.
 

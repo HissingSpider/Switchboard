@@ -23,6 +23,8 @@ export interface RunRecord {
   prompt: string;
   /** Set when the run is executing inside one skill's capability manifest. */
   skill: string | null;
+  /** The model this run asked for. Null = whatever the CLI defaults to. */
+  model: string | null;
   branch: string | null;
   exitCode: number | null;
   error: string | null;
@@ -51,6 +53,7 @@ interface Row {
   prompt: string;
   /** Set when the run is executing inside one skill's capability manifest. */
   skill: string | null;
+  model: string | null;
   branch: string | null;
   exit_code: number | null;
   error: string | null;
@@ -79,6 +82,7 @@ function toRun(r: Row): RunRecord {
     parentRunId: r.parent_run_id,
     prompt: r.prompt,
     skill: r.skill ?? null,
+    model: r.model ?? null,
     branch: r.branch,
     exitCode: r.exit_code,
     error: r.error,
@@ -103,6 +107,7 @@ export interface CreateRunInput {
   sessionId?: string | null;
   parentRunId?: string | null;
   skill?: string | null;
+  model?: string | null;
 }
 
 export class RunStore {
@@ -111,8 +116,8 @@ export class RunStore {
   create(input: CreateRunInput): RunRecord {
     this.db
       .prepare(
-        `INSERT INTO runs (id, created_at, status, project, project_path, agent, task_class, intent, channel, thread_id, session_id, parent_run_id, prompt, skill)
-         VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, created_at, status, project, project_path, agent, task_class, intent, channel, thread_id, session_id, parent_run_id, prompt, skill, model)
+         VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -128,6 +133,7 @@ export class RunStore {
         input.parentRunId ?? null,
         input.prompt,
         input.skill ?? null,
+        input.model ?? null,
       );
     return this.get(input.id)!;
   }
@@ -162,6 +168,7 @@ export class RunStore {
       sessionId: 'session_id',
       parentRunId: 'parent_run_id',
       skill: 'skill',
+      model: 'model',
       branch: 'branch',
       exitCode: 'exit_code',
       error: 'error',
@@ -226,6 +233,20 @@ export class RunStore {
          FROM runs WHERE created_at >= ? GROUP BY project ORDER BY costUsd DESC`,
       )
       .all(sinceIso) as unknown as Array<{ project: string; costUsd: number; runs: number }>;
+  }
+
+  /**
+   * Spend split by the model each run asked for. This is what says whether
+   * lane-based model selection is actually working: if `(default)` still owns
+   * the bill, something is routing everything to the top tier.
+   */
+  spendByModel(sinceIso: string): Array<{ model: string; costUsd: number; runs: number }> {
+    return this.db
+      .prepare(
+        `SELECT COALESCE(model, '(default)') AS model, SUM(cost_usd) AS costUsd, COUNT(*) AS runs
+         FROM runs WHERE created_at >= ? GROUP BY model ORDER BY costUsd DESC`,
+      )
+      .all(sinceIso) as unknown as Array<{ model: string; costUsd: number; runs: number }>;
   }
 
   /** On boot, anything still marked running is a leftover from a crash. */

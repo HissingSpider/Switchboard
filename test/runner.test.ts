@@ -10,6 +10,7 @@ import { SessionStore } from '../dist/store/sessions.js';
 import { ArtifactStore } from '../dist/store/artifacts.js';
 import { RunRegistry, BudgetExceededError } from '../dist/runner/registry.js';
 import { ClaudeProcess } from '../dist/runner/claude.js';
+import { modelFor } from '../dist/runner/profiles.js';
 import { GitWrapper } from '../dist/runner/git.js';
 import { installHook } from '../dist/runner/hook.js';
 import { sandbox, fakeClaudeShim, waitFor, type Sandbox } from './helpers.ts';
@@ -250,5 +251,34 @@ describe('a run never destroys uncommitted work', () => {
     assert.equal(started.stashed, false);
     const restored = await git.restore(started.base, started.stashed);
     assert.equal(restored.restored, true);
+  });
+});
+
+describe('model tiering', () => {
+  const cfg = { models: { chat: 'haiku', query: 'sonnet', bridge: 'haiku' } } as never;
+
+  test('each lane gets its own model, and task is left to the CLI', () => {
+    assert.equal(modelFor(cfg, { intent: 'chat' }), 'haiku');
+    assert.equal(modelFor(cfg, { intent: 'query' }), 'sonnet');
+    assert.equal(modelFor(cfg, { intent: 'task' }), undefined);
+  });
+
+  test('an unknown intent is treated as task, never as the cheap lane', () => {
+    // Getting this backwards would silently run real work on the small model.
+    assert.equal(modelFor(cfg, {}), undefined);
+  });
+
+  test('most specific wins: explicit over agent over lane', () => {
+    const agent = { name: 'dev', model: 'opus' } as never;
+    assert.equal(modelFor(cfg, { intent: 'chat', agent }), 'opus');
+    assert.equal(modelFor(cfg, { intent: 'chat', agent, explicit: 'sonnet' }), 'sonnet');
+  });
+
+  test('an agent with no model of its own still falls through to the lane', () => {
+    assert.equal(modelFor(cfg, { intent: 'chat', agent: { name: 'dev' } as never }), 'haiku');
+  });
+
+  test('no models configured at all leaves every lane on the CLI default', () => {
+    assert.equal(modelFor({} as never, { intent: 'chat' }), undefined);
   });
 });
