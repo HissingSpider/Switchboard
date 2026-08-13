@@ -250,7 +250,9 @@ describe('failure diagnosis cannot be steered from outside', () => {
    * must never be able to stop the system.
    */
   test('a run whose output mentions auth is not diagnosed as an auth failure', () => {
-    const run = { status: 'failed', exitCode: 1, error: null } as never;
+    // turns > 0 means the model actually ran, so the text is its output and
+    // therefore influenced by whatever was texted in.
+    const run = { status: 'failed', exitCode: 1, error: null, turns: 4 } as never;
     const d = diagnose(run, '', 'I fixed the unauthorized error and the invalid api key handling in auth.ts');
     assert.notEqual(d.kind, 'auth_expired');
     assert.equal(d.halt, false, 'nothing a message can say should halt the daemon');
@@ -266,5 +268,23 @@ describe('failure diagnosis cannot be steered from outside', () => {
   test('credit exhaustion on stderr still halts', () => {
     const run = { status: 'failed', exitCode: 1, error: null } as never;
     assert.equal(diagnose(run, 'Your credit balance is too low', '').halt, true);
+  });
+});
+
+describe('diagnosis distinguishes a CLI failure from model output', () => {
+  test('a run that never reached the model is diagnosed from its output', () => {
+    // claude prints its auth error and exits before any turn happens, so with
+    // zero turns the text cannot have been written by the model.
+    const run = { status: 'failed', exitCode: 1, error: null, turns: 0 } as never;
+    const d = diagnose(run, '', 'Failed to authenticate. API Error: 401 OAuth access token has expired.');
+    assert.equal(d.kind, 'auth_expired');
+    assert.equal(d.halt, true, 'expired credentials should stop the queue');
+  });
+
+  test('the same words from a model that did run are ignored', () => {
+    const run = { status: 'failed', exitCode: 1, error: null, turns: 6 } as never;
+    const d = diagnose(run, '', 'I fixed the unauthorized 401 handling in auth.ts');
+    assert.notEqual(d.kind, 'auth_expired');
+    assert.equal(d.halt, false);
   });
 });

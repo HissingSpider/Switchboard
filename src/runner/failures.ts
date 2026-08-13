@@ -107,21 +107,27 @@ export function classify(text: string): FailureKind {
 }
 
 /**
- * Diagnose a failure from the process's own output only.
+ * Diagnose a failure from output the model could not have influenced.
  *
- * Deliberately does NOT look at the run's result. That text is written by the
- * model in response to whatever a person texted in, so classifying on it means
- * a message containing the word "unauthorized" is diagnosed as expired
- * credentials — and `auth_expired` halts the daemon. That turns any inbound
- * message into a denial of service. stderr and our own error field are the only
- * sources we control.
+ * stderr and our own error field are always safe. The run's result is not: it
+ * is written by the model in response to whatever someone texted in, so
+ * classifying on it means a message containing "unauthorized" is diagnosed as
+ * expired credentials — and `auth_expired` halts the daemon. Any inbound
+ * message would become a denial of service.
+ *
+ * The exception is a run that produced no assistant turns at all. The CLI
+ * failing to authenticate prints its error and exits before the model is ever
+ * reached, so with zero turns the output cannot be model-authored and is the
+ * only place that diagnosis exists.
  */
-export function diagnose(run: RunRecord, stderr = '', _result = ''): Diagnosis {
+export function diagnose(run: RunRecord, stderr = '', result = ''): Diagnosis {
   if (run.status === 'killed') {
     const kind: FailureKind = /stuck/i.test(run.error ?? '') ? 'stuck' : 'killed';
     return { kind, ...REMEDIES[kind] };
   }
-  const kind = classify(`${stderr}\n${run.error ?? ''}`);
+  const neverReachedTheModel = (run.turns ?? 0) === 0;
+  const evidence = [stderr, run.error ?? '', neverReachedTheModel ? result : ''].join('\n');
+  const kind = classify(evidence);
   const base = REMEDIES[kind] ?? REMEDIES.unknown;
   return { kind: kind === 'unknown' && run.exitCode !== 0 ? 'crashed' : kind, ...base };
 }
@@ -143,7 +149,7 @@ export class FailureMonitor {
   inspect(run: RunRecord): Diagnosis | undefined {
     if (run.status === 'done') return undefined;
     const stderr = this.artifacts.read(run.id, 'stderr.log') ?? '';
-    const diagnosis = diagnose(run, stderr);
+    const diagnosis = diagnose(run, stderr, run.result ?? '');
 
     this.events.append({
       runId: run.id,
