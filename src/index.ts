@@ -104,7 +104,7 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   const skills = new SkillRegistry(cfg.resolved.skillsDir);
   const skillStore = new SkillStore(db);
   const devices = new DeviceStore(db);
-  const push = new PushService(db, events);
+  const push = new PushService(db, events, cfg.gateway.pushSubject);
 
   // Every skill on disk gets a row, so manifests and trust are tracked even for
   // the ones a human wrote by hand.

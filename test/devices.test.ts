@@ -5,7 +5,7 @@ import { createECDH, randomBytes, createPublicKey, createVerify } from 'node:cry
 import { openDb } from '../dist/store/db.js';
 import { EventLog } from '../dist/store/eventlog.js';
 import { DeviceStore } from '../dist/gateway/devices.js';
-import { PushService, generateVapidKeys, vapidHeader, encryptPayload } from '../dist/gateway/push.js';
+import { PushService, generateVapidKeys, vapidHeader, encryptPayload, isValidVapidSubject } from '../dist/gateway/push.js';
 import { checkReachability, serveCommand, formatReachability } from '../dist/net/reachability.js';
 import { sandbox, type Sandbox } from './helpers.ts';
 
@@ -193,5 +193,44 @@ describe('reachability', () => {
 
   test('the tailnet-only exposure command names the port', () => {
     assert.equal(serveCommand(7788), 'tailscale serve --bg 7788');
+  });
+});
+
+describe('vapid subject validation', () => {
+  /**
+   * This exists because a placeholder subject cost a live debugging session:
+   * Apple rejects the entire JWT with `BadJwtToken`, which points at the
+   * signature rather than at the one field that was actually wrong.
+   */
+  test('rejects the implausible contacts push providers refuse', () => {
+    for (const bad of [undefined, '', 'mailto:owner@localhost', 'mailto:me@localhost', 'mailto:nodomain', 'owner@example.com', 'http://example.com', 'https://localhost']) {
+      assert.equal(isValidVapidSubject(bad as string | undefined), false, String(bad));
+    }
+  });
+
+  test('accepts a real address or an https URL', () => {
+    for (const good of ['mailto:someone@example.com', 'mailto:a.b@sub.example.co.uk', 'https://example.com', 'https://host.tail1234.ts.net']) {
+      assert.equal(isValidVapidSubject(good), true, good);
+    }
+  });
+
+  test('a service with no valid contact refuses to send rather than failing opaquely', async () => {
+    const db = freshDb();
+    const push = new PushService(db, new EventLog(db), 'mailto:owner@localhost');
+    assert.ok(push.problem);
+    const ua = createECDH('prime256v1');
+    ua.generateKeys();
+    push.subscribe({
+      endpoint: 'https://push.example/x',
+      keys: { p256dh: ua.getPublicKey().toString('base64url'), auth: randomBytes(16).toString('base64url') },
+    });
+    // It must not even attempt the request — the subscription stays untouched.
+    assert.deepEqual(await push.send({ title: 'x', body: 'y' }), { sent: 0, failed: 0 });
+    assert.equal(push.list()[0]!.failures, 0);
+  });
+
+  test('a configured service has no problem to report', () => {
+    const db = freshDb();
+    assert.equal(new PushService(db, new EventLog(db), 'mailto:someone@example.com').problem, undefined);
   });
 });

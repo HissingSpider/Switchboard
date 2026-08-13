@@ -10,6 +10,7 @@ import { isRepo } from '../runner/git.js';
 import { SkillRegistry } from '../skills/loader.js';
 import { parseCron } from '../scheduler/cron.js';
 import { checkReachability } from '../net/reachability.js';
+import { isValidVapidSubject } from '../gateway/push.js';
 import { WhisperCppStt, WHISPER_INSTALL_HELP } from '../voice/stt.js';
 import { pickTts, TTS_INSTALL_HELP } from '../voice/tts.js';
 import { WakeWordDetector, WAKE_WORD_HELP } from '../voice/wakeword.js';
@@ -241,6 +242,18 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
     } catch (err) {
       add({ name: `heartbeat: ${job.name}`, status: 'fail', detail: (err as Error).message });
     }
+  }
+
+  // --- push -----------------------------------------------------------
+  if (!isValidVapidSubject(cfg.gateway.pushSubject)) {
+    add({
+      name: 'push contact',
+      status: 'warn',
+      detail: cfg.gateway.pushSubject ? `"${cfg.gateway.pushSubject}" is not a valid VAPID contact` : 'gateway.pushSubject is not set',
+      fix: 'set gateway.pushSubject to "mailto:you@example.com" or an https URL — Apple returns BadJwtToken otherwise',
+    });
+  } else {
+    add({ name: 'push contact', status: 'ok', detail: cfg.gateway.pushSubject! });
   }
 
   // --- voice ----------------------------------------------------------

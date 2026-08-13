@@ -98,6 +98,10 @@ public/        dashboard              skills/        starter skills
   request *looks* like loopback. `isLoopback` therefore rejects anything
   carrying a forwarding header — otherwise exposing the gateway to the tailnet
   would expose it with no authentication at all.
+- The VAPID `sub` is checked by the push providers, not just carried. Apple
+  returns `BadJwtToken` for an implausible contact — which points at the
+  signature, not at the one field that is actually wrong. `mailto:*@localhost`
+  fails; a real address or an https URL works. Never ship a placeholder here.
 - A browser cannot put a bearer token on a top-level navigation, so a token in
   localStorage authenticates `fetch` and nothing else. The device cookie set at
   claim time is what actually lets a paired phone load a page — do not remove it

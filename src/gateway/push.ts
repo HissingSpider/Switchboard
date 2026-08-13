@@ -203,15 +203,52 @@ export interface PushMessage {
   requireInteraction?: boolean;
 }
 
+/**
+ * The VAPID `sub` claim is a contact for whoever runs the push service, and the
+ * push providers actually check it. Apple rejects the whole JWT with
+ * `BadJwtToken` — not a helpful error about the subject — if it is a mailto
+ * with an implausible domain, which `localhost` very much is.
+ */
+export function isValidVapidSubject(subject: string | undefined): boolean {
+  if (!subject) return false;
+  if (subject.startsWith('https://')) {
+    try {
+      const host = new URL(subject).hostname;
+      return host.includes('.') && host !== 'localhost';
+    } catch {
+      return false;
+    }
+  }
+  if (!subject.startsWith('mailto:')) return false;
+  const address = subject.slice('mailto:'.length);
+  const [, domain] = address.split('@');
+  return Boolean(domain && domain.includes('.') && !domain.endsWith('.localhost') && domain !== 'localhost');
+}
+
 export class PushService {
   private readonly vapid: VapidKeys;
+  private readonly subject: string;
 
   constructor(
     private readonly db: Db,
     private readonly events: EventLog,
-    private readonly subject = 'mailto:owner@localhost',
+    subject?: string,
   ) {
     this.vapid = loadVapidKeys();
+    if (subject && !isValidVapidSubject(subject)) {
+      log.warn('gateway.pushSubject is not a valid VAPID contact — push will be rejected', { subject });
+    }
+    // No silent fallback to a placeholder: one that looks fine and fails with an
+    // opaque 403 is worse than an obviously missing setting.
+    this.subject = subject ?? '';
+  }
+
+  /** Why push cannot work right now, if it cannot. */
+  get problem(): string | undefined {
+    if (!isValidVapidSubject(this.subject)) {
+      return 'gateway.pushSubject must be a real mailto: address or an https: URL — the push providers reject anything else';
+    }
+    return undefined;
   }
 
   /** The public key the browser needs to subscribe. Safe to serve. */
@@ -244,6 +281,11 @@ export class PushService {
 
   /** Send to every subscription. Returns how many got through. */
   async send(message: PushMessage): Promise<{ sent: number; failed: number }> {
+    if (this.problem) {
+      log.warn('refusing to send push', { problem: this.problem });
+      this.events.append({ runId: null, kind: 'system.error', source: 'push', summary: `push not configured: ${this.problem}`, data: {} });
+      return { sent: 0, failed: 0 };
+    }
     const subs = this.list();
     let sent = 0;
     let failed = 0;

@@ -97,6 +97,12 @@ export interface GatewayConfig {
   authTokenRef?: string;
   /** Extra hostnames allowed through the Host/Origin check (e.g. the Tailscale name). */
   trustedHosts?: string[];
+  /**
+   * VAPID contact, sent to Apple and Google on every push. Must be a real
+   * `mailto:` address or an `https:` URL — Apple returns BadJwtToken for
+   * anything it considers implausible, including `mailto:you@localhost`.
+   */
+  pushSubject?: string;
 }
 
 export interface ImessageConfig {
