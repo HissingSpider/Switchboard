@@ -59,9 +59,28 @@ function portFree(host: string, port: number): Promise<boolean> {
  * Preflight. Everything that will bite you at 3am when a scheduled run fires
  * and nobody is watching, checked while you are sitting in front of it.
  */
+/**
+ * Ask the running daemon about itself.
+ *
+ * Anything permission-shaped has to be asked of the process that holds the
+ * permission. macOS attributes a TCC grant to the responsible process, and the
+ * doctor launched from a shell is attributed to the shell's app — so testing
+ * from here reports "denied" while the daemon is working perfectly.
+ */
+async function askDaemon<T>(cfg: LoadedConfig, path: string): Promise<T | undefined> {
+  try {
+    const res = await fetch(`http://${cfg.gateway.host}:${cfg.gateway.port}${path}`, { signal: AbortSignal.timeout(4000) });
+    return res.ok ? ((await res.json()) as T) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
   const checks: Check[] = [];
   const add = (c: Check): void => void checks.push(c);
+  const daemonStatus = await askDaemon<{ version: string }>(cfg, '/api/status');
+  const daemonRunning = Boolean(daemonStatus);
 
   // --- claude CLI -----------------------------------------------------
   const claudePath = cfg.claudeBin.includes('/') ? cfg.claudeBin : await which(cfg.claudeBin);
@@ -136,9 +155,14 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
   // --- gateway --------------------------------------------------------
   const free = await portFree(cfg.gateway.host, cfg.gateway.port);
   add({
-    name: 'gateway port',
-    status: free ? 'ok' : 'warn',
-    detail: `${cfg.gateway.host}:${cfg.gateway.port} ${free ? 'is free' : 'is already in use (Switchboard may already be running)'}`,
+    name: 'gateway',
+    // A port in use by our own daemon is the healthy case, not a warning.
+    status: free || daemonRunning ? 'ok' : 'warn',
+    detail: daemonRunning
+      ? `running at http://${cfg.gateway.host}:${cfg.gateway.port}`
+      : free
+        ? `${cfg.gateway.host}:${cfg.gateway.port} is free (daemon not running)`
+        : `${cfg.gateway.host}:${cfg.gateway.port} is in use by something else`,
   });
   if (cfg.gateway.host !== '127.0.0.1' && cfg.gateway.host !== 'localhost') {
     add({
@@ -205,20 +229,31 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
 
   // --- channels -------------------------------------------------------
   if (cfg.imessage.enabled && (cfg.imessage.mode ?? 'native') === 'native') {
-    const adapter = new NativeImessageAdapter(cfg.imessage, { workDir: join(cfg.resolved.dataDir, 'imessage') });
-    const problem = adapter.problem;
-    add({
-      name: 'iMessage (receive)',
-      status: problem ? 'fail' : 'ok',
-      detail: problem ?? `watching ~/Library/Messages/chat.db, ${cfg.imessage.allowlist.length} allowlisted sender(s)`,
-      fix: problem ? FULL_DISK_ACCESS_HELP : undefined,
-    });
-    add({
-      name: 'iMessage (send)',
-      status: 'warn',
-      detail: 'Messages automation is granted on first send — macOS will prompt once',
-    });
-    await adapter.stop();
+    const live = await askDaemon<{ receiving: boolean; problem?: string; allowlist: string[] }>(cfg, '/api/imessage');
+    if (live) {
+      add({
+        name: 'iMessage',
+        status: live.receiving ? 'ok' : 'fail',
+        detail: live.receiving
+          ? `watching for messages, ${live.allowlist.length} allowlisted sender(s)`
+          : (live.problem ?? 'not receiving'),
+        fix: live.receiving ? undefined : FULL_DISK_ACCESS_HELP,
+      });
+    } else {
+      // Without the daemon we can only test from here, and this process is not
+      // the one holding the grant — so say what the answer is worth.
+      const adapter = new NativeImessageAdapter(cfg.imessage, { workDir: join(cfg.resolved.dataDir, 'imessage') });
+      const problem = adapter.problem;
+      add({
+        name: 'iMessage',
+        status: 'warn',
+        detail: problem
+          ? `daemon not running; from this process it reads as "${problem}" — which says nothing about the daemon`
+          : 'daemon not running; the database is readable from here',
+        fix: 'start the daemon and re-run, so the check asks the process that holds the permission',
+      });
+      await adapter.stop();
+    }
   } else if (cfg.imessage.enabled) {
     try {
       const u = new URL('/api/v1/server/info', cfg.imessage.serverUrl);

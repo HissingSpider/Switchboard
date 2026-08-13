@@ -9,7 +9,7 @@ const exec = promisify(execFile);
 export interface ReachabilityReport {
   /** URLs that should work, best first. */
   urls: string[];
-  tailscale: { installed: boolean; running: boolean; hostname?: string; ip?: string; magicDns?: boolean };
+  tailscale: { installed: boolean; running: boolean; hostname?: string; ip?: string; magicDns?: boolean; serving?: boolean };
   lan: { ip?: string; url?: string };
   loopback: string;
   /** Things that will stop a phone connecting. */
@@ -18,6 +18,10 @@ export interface ReachabilityReport {
 }
 
 const TAILSCALE_PATHS = ['/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale', '/opt/homebrew/bin/tailscale'];
+
+function dnsNameOf(status: TailscaleStatus): string | undefined {
+  return status.Self?.DNSName?.replace(/\.$/, '');
+}
 
 function tailscaleBin(): string | undefined {
   return TAILSCALE_PATHS.find((p) => existsSync(p));
@@ -57,9 +61,20 @@ export async function checkReachability(gateway: GatewayConfig): Promise<Reachab
       const status = JSON.parse(stdout) as TailscaleStatus;
       tailscale.running = status.BackendState === 'Running';
       tailscale.magicDns = status.CurrentTailnet?.MagicDNSEnabled;
-      const dnsName = status.Self?.DNSName?.replace(/\.$/, '');
+      const dnsName = dnsNameOf(status);
       tailscale.hostname = dnsName;
       tailscale.ip = status.Self?.TailscaleIPs?.find((ip) => ip.includes('.'));
+
+      // `tailscale serve` proxying to our port is the recommended setup, not a
+      // gap: the daemon stays on loopback and Tailscale does the forwarding,
+      // inside the encrypted mesh, with a real certificate.
+      try {
+        const { stdout: serve } = await exec(bin, ['serve', 'status'], { timeout: 8000 });
+        tailscale.serving = serve.includes(`:${port}`) || serve.includes(`127.0.0.1:${port}`);
+        if (tailscale.serving && dnsNameOf(status)) urls.unshift(`https://${dnsNameOf(status)}`);
+      } catch {
+        tailscale.serving = false;
+      }
 
       if (!tailscale.running) problems.push(`Tailscale is installed but ${status.BackendState ?? 'not running'}`);
       if (tailscale.running && dnsName) urls.push(`http://${dnsName}:${port}`);
@@ -92,7 +107,9 @@ export async function checkReachability(gateway: GatewayConfig): Promise<Reachab
 
   // --- binding --------------------------------------------------------
   const boundToLoopback = gateway.host === '127.0.0.1' || gateway.host === 'localhost';
-  if (boundToLoopback && (tailscale.running || lan.ip)) {
+  if (boundToLoopback && tailscale.serving) {
+    advice.push('Loopback + `tailscale serve` is the right setup: encrypted, certificate-backed, and invisible to the LAN.');
+  } else if (boundToLoopback && (tailscale.running || lan.ip)) {
     problems.push(`gateway is bound to ${gateway.host}, so only this machine can connect`);
     advice.push(
       tailscale.running
