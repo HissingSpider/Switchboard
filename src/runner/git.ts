@@ -46,13 +46,50 @@ export class GitWrapper {
     return (await git(this.cwd, ['status', '--porcelain'])).length > 0;
   }
 
-  /** Create and check out `switchboard/<runId>`. Returns the branch name. */
-  async startRun(runId: string): Promise<{ branch: string; base: string; baseSha: string }> {
+  /**
+   * Create and check out `switchboard/<runId>`.
+   *
+   * Anything the operator had uncommitted is stashed first. Without that, the
+   * run's `git add -A` sweeps their work-in-progress into its own commit, and
+   * parking back to the base branch then deletes it from the working tree —
+   * silently, because the branch still has it. That has actually happened here:
+   * a source file vanished mid-session and only a gitignored build artifact
+   * hid the damage.
+   *
+   * Stashing also makes the run's diff honest: it contains what the agent did
+   * and not what the human happened to be halfway through.
+   */
+  async startRun(runId: string): Promise<{ branch: string; base: string; baseSha: string; stashed: boolean }> {
     const base = await this.currentBranch();
+    const stashed = await this.isDirty();
+    if (stashed) {
+      await git(this.cwd, ['stash', 'push', '--include-untracked', '-m', `switchboard: work in progress before ${runId}`]);
+    }
     const baseSha = await this.headSha();
     const branch = `switchboard/${runId}`;
     await git(this.cwd, ['checkout', '-b', branch]);
-    return { branch, base, baseSha };
+    return { branch, base, baseSha, stashed };
+  }
+
+  /**
+   * Return to the base branch and give the operator their work back.
+   *
+   * A failed pop is left alone rather than forced: the stash still holds
+   * everything, and reporting it is far better than resolving a conflict on
+   * someone's behalf.
+   */
+  async restore(base: string, stashed: boolean): Promise<{ restored: boolean; problem?: string }> {
+    await this.park(base);
+    if (!stashed) return { restored: true };
+    try {
+      await git(this.cwd, ['stash', 'pop']);
+      return { restored: true };
+    } catch (err) {
+      return {
+        restored: false,
+        problem: `your uncommitted work is still in \`git stash list\` — pop it by hand: ${(err as Error).message.split('\n')[0]}`,
+      };
+    }
   }
 
   /** Diff of everything the run touched, staged or not, against the base sha. */

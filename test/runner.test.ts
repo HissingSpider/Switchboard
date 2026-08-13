@@ -1,6 +1,6 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { openDb } from '../dist/store/db.js';
@@ -194,5 +194,61 @@ describe('hook installation', () => {
     const settings = JSON.parse(readFileSync(setup.settingsPath, 'utf8')) as { hooks: { PreToolUse: unknown[] } };
     assert.equal(settings.hooks.PreToolUse.length, 1);
     assert.match(readFileSync(setup.scriptPath, 'utf8'), /permissionDecision/);
+  });
+});
+
+describe('a run never destroys uncommitted work', () => {
+  /**
+   * This is a regression test for real data loss. A run does `git add -A` and
+   * commits, then checks out the base branch — which deletes any file that only
+   * existed in the operator's uncommitted work, because the run's branch now
+   * owns it. A source file vanished mid-session this way, and a gitignored
+   * build artifact hid the damage until much later.
+   */
+  test('an untracked file the operator was writing survives the run', async () => {
+    const dir = box.projectDir;
+    const mine = join(dir, 'my-work-in-progress.ts');
+    writeFileSync(mine, 'export const mine = 1;\n');
+
+    const git = new GitWrapper(dir);
+    const started = await git.startRun('r-stash1');
+    assert.equal(started.stashed, true, 'a dirty tree must be stashed');
+    assert.equal(existsSync(mine), false, 'the run should start from a clean tree');
+
+    // The run does its own work and commits it to the branch.
+    writeFileSync(join(dir, 'agent-output.txt'), 'what the agent did\n');
+    await git.commit('the agent’s work');
+
+    const restored = await git.restore(started.base, started.stashed);
+    assert.equal(restored.restored, true, restored.problem ?? '');
+    assert.equal(existsSync(mine), true, 'the operator’s file must come back');
+    assert.equal(readFileSync(mine, 'utf8'), 'export const mine = 1;\n');
+    assert.equal(existsSync(join(dir, 'agent-output.txt')), false, 'the agent’s work stays on its branch');
+
+    rmSync(mine, { force: true });
+  });
+
+  test('a modified tracked file is restored too, not just untracked ones', async () => {
+    const dir = box.projectDir;
+    const readme = join(dir, 'README.md');
+    const original = readFileSync(readme, 'utf8');
+    writeFileSync(readme, `${original}my unsaved edit\n`);
+
+    const git = new GitWrapper(dir);
+    const started = await git.startRun('r-stash2');
+    assert.equal(readFileSync(readme, 'utf8'), original, 'the run starts from the committed state');
+
+    await git.restore(started.base, started.stashed);
+    assert.match(readFileSync(readme, 'utf8'), /my unsaved edit/);
+
+    writeFileSync(readme, original);
+  });
+
+  test('a clean tree is not stashed, so nothing is disturbed', async () => {
+    const git = new GitWrapper(box.projectDir);
+    const started = await git.startRun('r-stash3');
+    assert.equal(started.stashed, false);
+    const restored = await git.restore(started.base, started.stashed);
+    assert.equal(restored.restored, true);
   });
 });

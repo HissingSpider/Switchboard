@@ -45,6 +45,8 @@ export interface ActiveRun {
   base?: string;
   baseSha?: string;
   permissionProfile: string;
+  /** The operator had uncommitted work, set aside for the duration of the run. */
+  stashed?: boolean;
   /** Set when the model asked a question and we are waiting on a human. */
   questionTimer?: NodeJS.Timeout;
   awaitingAnswerSince?: number;
@@ -197,6 +199,7 @@ export class RunRegistry extends EventEmitter {
     let branch: string | undefined;
     let base: string | undefined;
     let baseSha: string | undefined;
+    let stashed = false;
     const wantsGit = exec.git && project?.git !== false && isRepo(workdir);
     const git = wantsGit ? new GitWrapper(workdir) : null;
     if (git) {
@@ -205,13 +208,14 @@ export class RunRegistry extends EventEmitter {
         branch = started.branch;
         base = started.base;
         baseSha = started.baseSha;
+        stashed = started.stashed;
         this.runs.update(record.id, { branch });
         this.events.append({
           runId: record.id,
           kind: 'git.branch',
           source: 'runner',
-          summary: `${record.id} on branch ${branch} (from ${base})`,
-          data: { branch, base, baseSha },
+          summary: `${record.id} on branch ${branch} (from ${base})${stashed ? ' — your uncommitted work was stashed and will be restored' : ''}`,
+          data: { branch, base, baseSha, stashed },
         });
       } catch (err) {
         this.events.append({
@@ -265,6 +269,7 @@ export class RunRegistry extends EventEmitter {
       base,
       baseSha,
       permissionProfile: permissionProfileName,
+      stashed,
     };
     this.active.set(record.id, activeRun);
 
@@ -400,7 +405,18 @@ export class RunRegistry extends EventEmitter {
             data: { filesChanged: diff.filesChanged, insertions: diff.insertions, deletions: diff.deletions, files: diff.files },
           });
         }
-        if (run.base) await git.park(run.base);
+        if (run.base) {
+          const restored = await git.restore(run.base, Boolean(run.stashed));
+          if (!restored.restored) {
+            this.events.append({
+              runId: id,
+              kind: 'system.error',
+              source: 'runner',
+              summary: `${id}: could not restore your stashed work — ${restored.problem}`,
+              data: { problem: restored.problem },
+            });
+          }
+        }
       } catch (err) {
         log.warn('git finalize failed', { id, err: (err as Error).message });
       }
