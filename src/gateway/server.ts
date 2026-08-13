@@ -6,7 +6,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { LoadedConfig } from '../config/load.js';
 import { profileFor } from '../config/load.js';
 import { logger } from '../core/logger.js';
-import { authorize, isLoopback, bearerFrom, deviceCookie, isSecureRequest, cookieFrom, DEVICE_COOKIE } from './auth.js';
+import { authorize, isLoopback, bearerFrom, deviceCookie, isSecureRequest, cookieFrom, forwardedIdentity, DEVICE_COOKIE } from './auth.js';
 import { HOOK_PATH } from '../runner/hook.js';
 import { decide } from '../policy/policy.js';
 import { applySandbox, type SandboxContext } from '../skills/sandbox.js';
@@ -30,7 +30,7 @@ import type { DeviceStore } from './devices.js';
 import type { PushService } from './push.js';
 import type { SkillStore } from '../store/skills.js';
 import { considerPromotion, grantTrusted, proposeTrusted } from '../skills/trust.js';
-import { checkReachability, serveCommand } from '../net/reachability.js';
+import { checkReachability, serveCommand, noteForwardedRequest } from '../net/reachability.js';
 import type { InvestigationService } from '../investigate/loop.js';
 import type { EntityRegistry } from '../investigate/entities.js';
 import type { Vault } from '../vault/vault.js';
@@ -165,6 +165,11 @@ export class Gateway {
    * would let a revoked phone straight back in.
    */
   private authorizeRequest(req: IncomingMessage, res?: ServerResponse): { ok: true; device?: string } | { ok: false; status: number; message: string } {
+    // A forwarded request is the only proof this daemon can get that something
+    // outside the machine reached it — the Tailscale CLI is unreadable from a
+    // launchd daemon, so `tailscale serve` is otherwise invisible from in here.
+    if (forwardedIdentity(req)) noteForwardedRequest();
+
     // `bearerFrom` also reads ?token=, because EventSource cannot set headers.
     const presented = bearerFrom(req);
     const base = authorize(req, {

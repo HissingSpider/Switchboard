@@ -35,6 +35,9 @@ for (const btn of document.querySelectorAll('nav button')) {
   btn.onclick = () => {
     for (const b of document.querySelectorAll('nav button')) b.classList.toggle('active', b === btn);
     for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t.id === `tab-${btn.dataset.tab}`);
+    // Leaving Live and coming back should land on the list, not on whichever
+    // run happened to be open before.
+    if (btn.dataset.tab !== 'live') setView('list');
     if (btn.dataset.tab === 'history') loadHistory();
     if (btn.dataset.tab === 'board') loadBoard();
     if (btn.dataset.tab === 'cost') loadCost();
@@ -78,23 +81,43 @@ async function refreshRuns() {
       </div>`,
     )
     .join('');
-  for (const card of document.querySelectorAll('.runcard')) card.onclick = () => selectRun(card.dataset.id);
+  for (const card of document.querySelectorAll('.runcard')) card.onclick = () => selectRun(card.dataset.id, { user: true });
   if (!state.selected && runs[0]) selectRun(runs[0].id);
 }
 
-async function selectRun(id) {
+/**
+ * On a phone the run list and the run itself are two screens rather than two
+ * columns; on a wide screen `data-view` is set but nothing reads it. Pushing a
+ * history entry means the phone's back gesture returns to the list instead of
+ * leaving the app, which is what anyone actually expects from a Home Screen icon.
+ */
+const isPhone = () => window.matchMedia('(max-width: 640px)').matches;
+
+function setView(view, { push = false } = {}) {
+  document.body.dataset.view = view;
+  if (push && isPhone()) history.pushState({ view }, '');
+  if (view === 'list') window.scrollTo(0, 0);
+}
+setView('list');
+
+window.addEventListener('popstate', () => setView('list'));
+
+async function selectRun(id, opts = {}) {
   state.selected = id;
+  if (opts.user) setView('detail', { push: true });
   const { run, artifacts, children } = await api(`/api/runs/${id}`);
   const { events } = await api(`/api/runs/${id}/events`);
   state.events = events;
 
   const hasDiff = artifacts.some((a) => a.name === 'changes.diff');
   $('#runhead').innerHTML =
+    `<button class="backbtn" id="backbtn">‹ Runs</button>` +
     `<b>${run.id}</b> <span class="dim">${run.status} · ${run.project ?? 'scratch'} · ${run.agent ?? 'default'} · ${run.taskClass} · ${run.turns} turns · $${run.costUsd.toFixed(3)}</span>` +
     (run.branch ? ` <span class="dim">· ${esc(run.branch)}</span>` : '') +
     (hasDiff ? ` <button id="showdiff">diff</button>` : '') +
     ` <button id="verbose">${state.verbose ? 'hide detail' : 'show detail'}</button>` +
     (children?.length ? ` <span class="dim">· ${children.length} child run(s)</span>` : '');
+  $('#backbtn').onclick = () => (history.state?.view === 'detail' ? history.back() : setView('list'));
   if (hasDiff) $('#showdiff').onclick = () => showDiff(run.id);
   $('#verbose').onclick = () => {
     state.verbose = !state.verbose;
@@ -276,7 +299,7 @@ $('#submit').onsubmit = async (e) => {
   const { run } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
   $('#prompt').value = '';
   await refreshRuns();
-  selectRun(run.id);
+  selectRun(run.id, { user: true });
 };
 $('#prompt').onkeydown = (e) => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#submit').requestSubmit();
@@ -334,7 +357,7 @@ async function loadHistory() {
   for (const tr of $('#history').querySelectorAll('tr[data-id]')) {
     tr.onclick = () => {
       document.querySelector('nav button[data-tab="live"]').click();
-      selectRun(tr.dataset.id);
+      selectRun(tr.dataset.id, { user: true });
     };
   }
 }

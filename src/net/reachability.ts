@@ -27,6 +27,45 @@ function tailscaleBin(): string | undefined {
   return TAILSCALE_PATHS.find((p) => existsSync(p));
 }
 
+/**
+ * The tailnet's own address on this machine, read from the interface list.
+ *
+ * The CLI is not a reliable witness here: the App Store build of Tailscale ships
+ * a shim that tries to talk to the GUI, and from a launchd daemon that fails and
+ * prints prose to stdout. Believing it means reporting "Tailscale is not running"
+ * to someone whose phone is connected over it right now. An address in the CGNAT
+ * range 100.64.0.0/10 on a utun interface is the tailnet, with nothing to ask.
+ */
+function tailnetAddress(): string | undefined {
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const addr of addrs ?? []) {
+      if (addr.family !== 'IPv4') continue;
+      const [a, b] = addr.address.split('.').map(Number) as [number, number];
+      if (a === 100 && b >= 64 && b <= 127) return addr.address;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * When a request last arrived through a proxy rather than from this machine.
+ *
+ * Under `tailscale serve` the proxy is Tailscale, so this is direct evidence
+ * that something outside the Mac Mini reached the gateway — the one thing the
+ * CLI cannot tell us from inside a launchd daemon. A week is deliberately
+ * generous: the claim is "this path works", not "someone used it recently".
+ */
+let lastForwardedAt: number | undefined;
+const FORWARDED_MEMORY_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function noteForwardedRequest(at = Date.now()): void {
+  lastForwardedAt = at;
+}
+
+function reachedFromOutside(): boolean {
+  return lastForwardedAt !== undefined && Date.now() - lastForwardedAt < FORWARDED_MEMORY_MS;
+}
+
 interface TailscaleStatus {
   BackendState?: string;
   Self?: { DNSName?: string; TailscaleIPs?: string[] };
@@ -83,7 +122,13 @@ export async function checkReachability(gateway: GatewayConfig): Promise<Reachab
         advice.push('MagicDNS is off — use the 100.x address, or turn MagicDNS on for a stable hostname');
       }
     } catch (err) {
-      problems.push(`could not read Tailscale status: ${(err as Error).message}`);
+      // `status --json` is not always available to us: run from launchd, the
+      // App Store build answers with a plain-English refusal on stdout rather
+      // than JSON, and a parser error names the wrong culprit entirely — it
+      // reads as "Tailscale is off" while the tailnet is up and serving.
+      // `serve status` is the question that actually matters (can the phone
+      // reach this?), so ask that directly before concluding anything.
+      await describeServeOnly(bin, port, tailscale, urls, problems, advice, err as Error);
     }
   } else {
     problems.push('Tailscale is not installed — the phone has no path to the gateway');
@@ -107,6 +152,9 @@ export async function checkReachability(gateway: GatewayConfig): Promise<Reachab
 
   // --- binding --------------------------------------------------------
   const boundToLoopback = gateway.host === '127.0.0.1' || gateway.host === 'localhost';
+  // Something already came through a proxy to get here, so "only this machine
+  // can connect" would be a claim contradicted by the request that asked.
+  if (!tailscale.serving && reachedFromOutside()) tailscale.serving = true;
   if (boundToLoopback && tailscale.serving) {
     advice.push('Loopback + `tailscale serve` is the right setup: encrypted, certificate-backed, and invisible to the LAN.');
   } else if (boundToLoopback && (tailscale.running || lan.ip)) {
@@ -124,6 +172,54 @@ export async function checkReachability(gateway: GatewayConfig): Promise<Reachab
   }
 
   return { urls: [...new Set(urls)], tailscale, lan, loopback, problems, advice };
+}
+
+/**
+ * Fallback when `tailscale status --json` could not be read. Anything that
+ * `serve status` prints is proof the CLI reached a running backend, and the
+ * URL it prints is the one the phone should be using — so a working tailnet is
+ * never reported as a missing one just because the JSON door was shut.
+ */
+async function describeServeOnly(
+  bin: string,
+  port: number,
+  tailscale: ReachabilityReport['tailscale'],
+  urls: string[],
+  problems: string[],
+  advice: string[],
+  parseError: Error,
+): Promise<void> {
+  try {
+    const { stdout } = await exec(bin, ['serve', 'status'], { timeout: 8000 });
+    const host = /https:\/\/([^\s/]+)/.exec(stdout)?.[1];
+    tailscale.serving = stdout.includes(`:${port}`);
+    if (tailscale.serving && host) {
+      tailscale.running = true;
+      tailscale.hostname = host;
+      urls.unshift(`https://${host}`);
+      return;
+    }
+  } catch {
+    // Fall through to the interface check, below.
+  }
+
+  const ip = tailnetAddress();
+  if (ip) {
+    // The tailnet is up; only the CLI is unreachable. Say which, because the
+    // two have completely different fixes and only one of them is a problem.
+    tailscale.running = true;
+    tailscale.ip = ip;
+    urls.push(`http://${ip}:${port}`);
+    advice.push(
+      'Tailscale is up (this machine holds ' +
+        ip +
+        ') but its CLI could not be queried from the daemon — the App Store build needs a logged-in GUI session. ' +
+        'Run `tailscale serve status` yourself to confirm the https:// name.',
+    );
+    return;
+  }
+
+  problems.push(`could not read Tailscale status: ${parseError.message}`);
 }
 
 /**

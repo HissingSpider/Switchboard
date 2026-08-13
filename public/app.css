@@ -301,7 +301,9 @@ dialog pre { margin: 0; padding: 12px; overflow: auto; max-height: 70vh; font-fa
 .act .arg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .act.sub { opacity: 0.55; }
 
-.note { padding: 5px 16px; font-size: 12px; color: var(--dim); }
+/* A confirm line carries a raw tool argument, which has no spaces to wrap at
+   and would otherwise run off the side of a phone. */
+.note { padding: 5px 16px; font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
 .note.warn { color: var(--warn); }
 .note.bad { color: var(--bad); }
 
@@ -320,9 +322,94 @@ dialog pre { margin: 0; padding: 12px; overflow: auto; max-height: 70vh; font-fa
 }
 
 /* A grid item defaults to min-content width, so a long prompt widens the
-   column instead of ellipsing inside it. */
-.split { grid-template-columns: 300px minmax(0, 1fr); }
+   column instead of ellipsing inside it. This has to stay inside the same
+   width query as the layout above it — an unscoped `.split` here would land
+   after the phone rules and quietly put the two columns back. */
+@media (min-width: 861px) {
+  .split { grid-template-columns: 300px minmax(0, 1fr); }
+}
 .split > * { min-width: 0; }
 .runlist { min-width: 0; }
 .runcard { min-width: 0; overflow: hidden; }
 .runcard > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ------------------------------------------------- phone: list, then detail
+
+   Two stacked scroll areas on a 375px screen means neither is usable — you get
+   a third of a run list above a third of a transcript. So on a phone the two
+   halves of `.split` become two screens: the run list, and the run you tapped.
+   `body[data-view]` is set by app.js; on desktop it is ignored entirely. */
+
+.backbtn { display: none; }
+
+@media (max-width: 640px) {
+  main { padding-top: 8px; }
+
+  body[data-view='detail'] .runlist,
+  body[data-view='detail'] .submit { display: none; }
+  body[data-view='list'] .stream { display: none; }
+
+  .backbtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px 6px 6px;
+    margin-right: 2px;
+    background: var(--panel-2);
+  }
+
+  /* One list, one transcript — each gets the whole screen it was promised. */
+  .runlist { max-height: none; overflow: visible; gap: 8px; }
+  .runcard { padding: 11px 12px; border-radius: 9px; }
+  .runcard .prompt { font-size: 13.5px; margin-top: 4px; }
+
+  .stream {
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    margin: -8px -12px 0;
+  }
+  .runhead {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    background: var(--panel);
+    padding: 8px 12px;
+    gap: 6px;
+    font-size: 11px;
+  }
+  /* The header is a landmark, not a readout — it must not cost three lines. */
+  .runhead .dim { flex-basis: 100%; }
+  .runhead button:not(.backbtn) { min-height: 32px; padding: 4px 9px; font-size: 11px; }
+  .events { max-height: none; overflow: visible; }
+
+  /* The follow-up bar is the one control you reach for mid-run, so it sits
+     where a thumb already is instead of at the bottom of the transcript. */
+  .followup {
+    position: sticky;
+    bottom: 0;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+    margin: 0 -12px;
+  }
+  .followup input { min-width: 0; }
+
+  /* The submit box is the first thing you see on the list screen; give the
+     prompt room and let the selects wrap two-up rather than three-across. */
+  #prompt { rows: 3; min-height: 76px; font-size: 16px; } /* 16px: iOS zooms below it */
+  .submit .row { display: grid; grid-template-columns: 1fr 1fr; }
+  .submit .row select { width: 100%; }
+  /* Voice is pulled ahead of Run so it fills the gap the third select leaves,
+     rather than costing a whole row of its own. */
+  .submit .row .linkbtn { order: 1; text-align: center; line-height: 30px; }
+  .submit .row button[type='submit'] {
+    order: 2; grid-column: 1 / -1;
+    background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600;
+  }
+
+  /* Inputs under 16px make iOS zoom the whole page on focus and never zoom back. */
+  input, select, textarea { font-size: 16px; }
+
+  .say { font-size: 15.5px; line-height: 1.6; }
+}
