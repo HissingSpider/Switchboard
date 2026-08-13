@@ -6,7 +6,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { LoadedConfig } from '../config/load.js';
 import { profileFor } from '../config/load.js';
 import { logger } from '../core/logger.js';
-import { authorize, isLoopback, bearerFrom } from './auth.js';
+import { authorize, isLoopback, bearerFrom, deviceCookie, isSecureRequest, cookieFrom, DEVICE_COOKIE } from './auth.js';
 import { HOOK_PATH } from '../runner/hook.js';
 import { decide } from '../policy/policy.js';
 import { applySandbox, type SandboxContext } from '../skills/sandbox.js';
@@ -100,6 +100,8 @@ export class Gateway {
     this.voiceWss = new WebSocketServer({ noServer: true });
 
     this.server.on('upgrade', (req, socket, head) => {
+      // No response object on an upgrade, so no cookie can be issued here — a
+      // socket client has already been through an HTTP request to get one.
       const auth = this.authorizeRequest(req);
       if (!auth.ok) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -159,7 +161,7 @@ export class Gateway {
    * proxied request arrives from 127.0.0.1, so falling back to loopback trust
    * would let a revoked phone straight back in.
    */
-  private authorizeRequest(req: IncomingMessage): { ok: true; device?: string } | { ok: false; status: number; message: string } {
+  private authorizeRequest(req: IncomingMessage, res?: ServerResponse): { ok: true; device?: string } | { ok: false; status: number; message: string } {
     // `bearerFrom` also reads ?token=, because EventSource cannot set headers.
     const presented = bearerFrom(req);
     const base = authorize(req, {
@@ -171,7 +173,15 @@ export class Gateway {
     // The Host check is not something a device token can override.
     if (base.status === 403) return base;
     const device = presented ? this.d.devices.authenticate(presented) : undefined;
-    if (device) return { ok: true, device: device.id };
+    if (device) {
+      // A device that authenticated with a bearer token but has no cookie yet
+      // gets one now. Without it the device can call the API but can never load
+      // a page, because a navigation carries no Authorization header.
+      if (res && !cookieFrom(req, DEVICE_COOKIE) && !res.headersSent) {
+        res.setHeader('set-cookie', deviceCookie(presented!, isSecureRequest(req)));
+      }
+      return { ok: true, device: device.id };
+    }
     return { ok: false, status: 401, message: presented ? 'that token is not valid' : base.message };
   }
 
@@ -226,8 +236,17 @@ export class Gateway {
         return this.static(res, path);
       }
 
-      const auth = this.authorizeRequest(req);
-      if (!auth.ok) return json(res, auth.status, { error: auth.message });
+      const auth = this.authorizeRequest(req, res);
+      if (!auth.ok) {
+        // A browser asking for a page, with no credential, is an unpaired
+        // device — send it somewhere it can do something about that instead of
+        // showing it a JSON error.
+        if (auth.status === 401 && wantsHtml(req) && !path.startsWith('/api/')) {
+          res.writeHead(302, { location: '/pair.html' });
+          return void res.end();
+        }
+        return json(res, auth.status, { error: auth.message });
+      }
 
       if (path.startsWith('/api/')) return await this.api(req, res, url);
       if (path === '/events') return this.sse(req, res, url);
@@ -375,6 +394,9 @@ export class Gateway {
       if (!body.code) return json(res, 400, { error: 'code is required' });
       const result = this.d.devices.claim(body.code, body.name ?? 'phone', String(req.headers['user-agent'] ?? ''));
       if ('error' in result) return json(res, 400, result);
+      // The cookie is what lets the browser load the dashboard at all; the
+      // token in the body is for native clients and the websocket.
+      res.setHeader('set-cookie', deviceCookie(result.token, isSecureRequest(req)));
       this.d.events.append({
         runId: null,
         kind: 'system.start',
@@ -724,6 +746,12 @@ export class Gateway {
 }
 
 const BOOTSTRAP_ASSETS = new Set(['/pair.html', '/app.css', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/apple-touch-icon.png']);
+
+/** A top-level navigation, as opposed to a fetch or an API call. */
+function wantsHtml(req: IncomingMessage): boolean {
+  const accept = String(req.headers.accept ?? '');
+  return req.method === 'GET' && accept.includes('text/html');
+}
 
 function isBootstrapPath(path: string, method: string): boolean {
   if (path === '/api/devices/claim') return method === 'POST';

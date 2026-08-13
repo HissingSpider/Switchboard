@@ -98,6 +98,13 @@ public/        dashboard              skills/        starter skills
   request *looks* like loopback. `isLoopback` therefore rejects anything
   carrying a forwarding header — otherwise exposing the gateway to the tailnet
   would expose it with no authentication at all.
+- A browser cannot put a bearer token on a top-level navigation, so a token in
+  localStorage authenticates `fetch` and nothing else. The device cookie set at
+  claim time is what actually lets a paired phone load a page — do not remove it
+  in favour of "just use the token".
+- An unauthenticated request that looks like a browser navigation gets a 302 to
+  /pair.html rather than a JSON 401. A person who sees `{"error":"missing or
+  invalid token"}` has been told nothing they can act on.
 - `/pair.html` and `POST /api/devices/claim` are the one unauthenticated hole,
   and it has to exist: a new phone has no token yet. It is safe because claiming
   needs a single-use code that expires in five minutes and is only ever shown on

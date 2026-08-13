@@ -26,7 +26,7 @@
         Open Switchboard on the Mac Mini, go to Setup, and press <b>New pairing code</b>. Type it here.
         The code is good for five minutes and works once.
       </p>
-      <input id="code" placeholder="abc-def" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" />
+      <input id="code" placeholder="abc-def" inputmode="text" maxlength="7" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" />
       <input id="name" placeholder="what to call this device" value="phone" />
       <button type="submit">Pair</button>
       <div id="result" class="result" hidden></div>
@@ -38,6 +38,27 @@
       // this device never needs the shared gateway secret.
       const form = document.querySelector('#form');
       const result = document.querySelector('#result');
+      const codeInput = document.querySelector('#code');
+
+      // Codes are always three characters, a dash, three characters. Typing the
+      // dash by hand on a phone keyboard is a needless trip to the symbol pane,
+      // so insert it — while still accepting it if it is typed.
+      codeInput.addEventListener('input', () => {
+        const bare = codeInput.value.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 6);
+        codeInput.value = bare.length > 3 ? `${bare.slice(0, 3)}-${bare.slice(3)}` : bare;
+      });
+
+      // A device paired before cookies existed has a token but no cookie, so it
+      // can call the API and still be bounced from every page. Exchange the one
+      // for the other rather than making it pair again.
+      const existing = localStorage.getItem('swb-token');
+      if (existing) {
+        fetch('/api/status', { headers: { authorization: `Bearer ${existing}` } })
+          .then((res) => {
+            if (res.ok) location.replace('/');
+          })
+          .catch(() => undefined);
+      }
 
       const show = (text, ok) => {
         result.hidden = false;
@@ -47,7 +68,7 @@
 
       form.onsubmit = async (event) => {
         event.preventDefault();
-        const code = document.querySelector('#code').value.trim().toLowerCase();
+        const code = codeInput.value.trim().toLowerCase();
         const name = document.querySelector('#name').value.trim() || 'phone';
         if (!code) return;
         try {
@@ -59,6 +80,9 @@
           const body = await res.json();
           if (!res.ok || body.error) return show(body.error ?? `pairing failed (${res.status})`, false);
 
+          // The server also set an HttpOnly cookie, which is what actually
+          // authenticates the navigation to '/'. These are for the websocket
+          // and for showing which device this is.
           localStorage.setItem('swb-token', body.token);
           localStorage.setItem('swb-device-id', body.device.id);
           show('Paired. Opening Switchboard…', true);

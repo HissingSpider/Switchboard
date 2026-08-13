@@ -34,11 +34,55 @@ function safeEqual(a: string, b: string): boolean {
   return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
+export const DEVICE_COOKIE = 'swb_token';
+
+export function cookieFrom(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers.cookie;
+  if (!raw) return undefined;
+  for (const part of raw.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) return decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return undefined;
+}
+
+/**
+ * The credential on a request, from any of the three places a browser can put
+ * one.
+ *
+ * The cookie is not a convenience — it is the only one of the three that a
+ * browser will attach to a top-level navigation. A token in localStorage can
+ * only ever be added to `fetch`, so a paired phone opening the dashboard would
+ * be refused at the document request and never get as far as running any JS.
+ */
 export function bearerFrom(req: IncomingMessage): string | undefined {
   const header = req.headers.authorization;
   if (header?.startsWith('Bearer ')) return header.slice(7).trim();
   const url = new URL(req.url ?? '/', 'http://localhost');
-  return url.searchParams.get('token') ?? undefined;
+  return url.searchParams.get('token') ?? cookieFrom(req, DEVICE_COOKIE) ?? undefined;
+}
+
+/** Was this request made over TLS, directly or through a terminating proxy? */
+export function isSecureRequest(req: IncomingMessage): boolean {
+  if (req.headers['x-forwarded-proto'] === 'https') return true;
+  return Boolean((req.socket as { encrypted?: boolean }).encrypted);
+}
+
+/** A year-long, JS-invisible cookie. Revoking the device is what ends it. */
+export function deviceCookie(token: string, secure: boolean): string {
+  return [
+    `${DEVICE_COOKIE}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'Max-Age=31536000',
+    'HttpOnly',
+    // Lax still arrives on the top-level navigation we need it for, while
+    // blocking the cross-site POSTs that would otherwise be a CSRF opening.
+    'SameSite=Lax',
+    secure ? 'Secure' : '',
+  ]
+    .filter(Boolean)
+    .join('; ');
 }
 
 /** Headers that prove a request was forwarded rather than made locally. */

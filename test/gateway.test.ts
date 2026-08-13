@@ -468,3 +468,188 @@ describe('pairing bootstrap', () => {
     }
   });
 });
+
+describe('browser navigation auth', () => {
+  const nav = (path: string, headers: Record<string, string> = {}): Promise<{ status: number; location?: string; setCookie?: string }> =>
+    new Promise((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gw.port,
+          path,
+          method: 'GET',
+          headers: { host: 'johns-mac-mini.tail20dab6.ts.net', 'x-forwarded-for': '100.64.0.9', accept: 'text/html', ...headers },
+        },
+        (r) => {
+          r.resume();
+          resolve({ status: r.statusCode ?? 0, location: r.headers.location as string | undefined });
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+  test('claiming sets a cookie, because localStorage cannot authenticate a navigation', async () => {
+    const { code } = ctx.devices.createPairingCode();
+    const result = await new Promise<{ status: number; setCookie?: string; body: string }>((resolve, reject) => {
+      const payload = JSON.stringify({ code, name: 'nav phone' });
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gw.port,
+          path: '/api/devices/claim',
+          method: 'POST',
+          headers: {
+            host: 'johns-mac-mini.tail20dab6.ts.net',
+            'x-forwarded-for': '100.64.0.9',
+            'x-forwarded-proto': 'https',
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(payload)),
+          },
+        },
+        (r) => {
+          let body = '';
+          r.setEncoding('utf8');
+          r.on('data', (c) => (body += c));
+          r.on('end', () => resolve({ status: r.statusCode ?? 0, setCookie: (r.headers['set-cookie'] ?? [])[0], body }));
+        },
+      );
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+
+    assert.equal(result.status, 201);
+    assert.ok(result.setCookie, 'claim must set a cookie');
+    assert.match(result.setCookie!, /^swb_token=/);
+    assert.match(result.setCookie!, /HttpOnly/);
+    assert.match(result.setCookie!, /SameSite=Lax/);
+    assert.match(result.setCookie!, /Secure/, 'https requests must get a Secure cookie');
+
+    // That cookie must then get the dashboard itself, not just the API.
+    const cookie = result.setCookie!.split(';')[0]!;
+    assert.equal((await nav('/', { cookie })).status, 200);
+    assert.equal((await nav('/app.js', { cookie })).status, 200);
+  });
+
+  test('an unpaired browser is sent to the pairing page, not shown a JSON error', async () => {
+    const res = await nav('/');
+    assert.equal(res.status, 302);
+    assert.equal(res.location, '/pair.html');
+  });
+
+  test('an unauthenticated API call still gets a plain 401', async () => {
+    const res = await nav('/api/status', { accept: 'application/json' });
+    assert.equal(res.status, 401);
+  });
+
+  test('a plain-http claim does not get a Secure cookie, or it would never be set', async () => {
+    const { code } = ctx.devices.createPairingCode();
+    const payload = JSON.stringify({ code, name: 'http phone' });
+    const setCookie = await new Promise<string | undefined>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gw.port,
+          path: '/api/devices/claim',
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) },
+        },
+        (r) => {
+          r.resume();
+          resolve((r.headers['set-cookie'] ?? [])[0]);
+        },
+      );
+      req.on('error', reject);
+      req.write(payload);
+      req.end();
+    });
+    assert.ok(setCookie);
+    assert.equal(/Secure/.test(setCookie!), false);
+  });
+});
+
+describe('token to cookie upgrade', () => {
+  test('a bearer-authenticated device is issued a cookie it did not have', async () => {
+    const { code } = ctx.devices.createPairingCode();
+    const claimed = ctx.devices.claim(code, 'legacy phone') as { token: string };
+
+    const setCookie = await new Promise<string | undefined>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gw.port,
+          path: '/api/status',
+          headers: {
+            host: 'johns-mac-mini.tail20dab6.ts.net',
+            'x-forwarded-for': '100.64.0.9',
+            authorization: `Bearer ${claimed.token}`,
+          },
+        },
+        (r) => {
+          r.resume();
+          resolve((r.headers['set-cookie'] ?? [])[0]);
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+    assert.ok(setCookie, 'a device with no cookie should be issued one');
+    assert.match(setCookie!, /^swb_token=/);
+  });
+
+  test('a request that already has the cookie is not re-issued one', async () => {
+    const { code } = ctx.devices.createPairingCode();
+    const claimed = ctx.devices.claim(code, 'cookied phone') as { token: string };
+    const setCookie = await new Promise<string | undefined>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gw.port,
+          path: '/api/status',
+          headers: {
+            host: 'johns-mac-mini.tail20dab6.ts.net',
+            'x-forwarded-for': '100.64.0.9',
+            cookie: `swb_token=${claimed.token}`,
+          },
+        },
+        (r) => {
+          r.resume();
+          resolve((r.headers['set-cookie'] ?? [])[0]);
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(setCookie, undefined);
+  });
+
+  test('a revoked device cannot resurrect itself with its old cookie', async () => {
+    const { code } = ctx.devices.createPairingCode();
+    const claimed = ctx.devices.claim(code, 'doomed phone') as { device: { id: string }; token: string };
+    ctx.devices.revoke(claimed.device.id);
+
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: gw.port,
+          path: '/api/status',
+          headers: {
+            host: 'johns-mac-mini.tail20dab6.ts.net',
+            'x-forwarded-for': '100.64.0.9',
+            cookie: `swb_token=${claimed.token}`,
+          },
+        },
+        (r) => {
+          r.resume();
+          resolve(r.statusCode ?? 0);
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(status, 401);
+  });
+});
