@@ -168,6 +168,19 @@ public/        dashboard              skills/        starter skills
   branches and stashes, so your uncommitted work vanishes mid-edit and comes
   back when the run ends. The stash is the safety net working exactly as
   designed — but commit first, or use a read-only lane.
+- A run commits an explicit pathspec, never `git add -A`. The stash at
+  `startRun()` only closes the door at t=0; edits the operator makes *during*
+  the run were swept into the run's commit, under a message about something
+  else. The pathspec is built from the `Write`/`Edit`/`NotebookEdit` calls in
+  the run's own stream, withdrawn again if the gate refuses one. A change made
+  through a shell command names no path, so it stays uncommitted and is
+  reported as `unclaimed` — leaving a real change in the working tree is
+  recoverable, committing someone else's work is not.
+- Paths are matched through `realpath` on both sides. A run reports absolute
+  paths from its own cwd, which macOS hands back as `/private/var/...`, while
+  the configured project path is the `/var/...` a person typed. Compare those
+  with a plain prefix test and every file in the repo reads as outside it, so
+  the run stages nothing and commits nothing — silently.
 - A warm turn needs a ceiling. `WarmSession` resolves on `result` or `exit`, so
   a process that stays alive and says nothing never settles — and an unbounded
   wait strands the run in `queued`, where `sweep()` cannot cap it and `kill()`

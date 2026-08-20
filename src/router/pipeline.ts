@@ -259,7 +259,7 @@ function summarizePatch(patch: string): string {
     else if (line.startsWith('+') && !line.startsWith('+++')) added++;
     else if (line.startsWith('-') && !line.startsWith('---')) removed++;
   }
-  return formatDiffStat({ filesChanged: files.size, insertions: added, deletions: removed, files: [], patch: '', truncated: false });
+  return formatDiffStat({ filesChanged: files.size, insertions: added, deletions: removed });
 }
 
 function truncate(s: string, n: number): string {

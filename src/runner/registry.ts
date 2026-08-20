@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { mkdirSync, readFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import type { LoadedConfig } from '../config/load.js';
 import { findProject, profileFor, expandPath } from '../config/load.js';
 import type { AgentConfig, TaskClass } from '../config/schema.js';
@@ -49,6 +50,13 @@ export interface ActiveRun {
   permissionProfile: string;
   /** The operator had uncommitted work, set aside for the duration of the run. */
   stashed?: boolean;
+  /**
+   * Absolute paths the gate saw this run write. This is what gets committed —
+   * the working tree is shared with whoever is sitting at the machine, so
+   * "everything that is dirty" is not the same question as "what did this run
+   * do", and only the second one belongs in the run's commit.
+   */
+  wrote: Set<string>;
   /** Set when the model asked a question and we are waiting on a human. */
   questionTimer?: NodeJS.Timeout;
   awaitingAnswerSince?: number;
@@ -403,6 +411,7 @@ export class RunRegistry extends EventEmitter {
       baseSha,
       permissionProfile: permissionProfileName,
       stashed,
+      wrote: new Set<string>(),
     };
     this.active.set(record.id, activeRun);
 
@@ -478,6 +487,10 @@ export class RunRegistry extends EventEmitter {
           summary: `${ev.name}: ${truncate(describeTool(ev.name, ev.input), 200)}`,
           data: { tool: ev.name, input: ev.input, toolUseId: ev.id },
         });
+        // A tool_use naming a file is this run claiming that path, which is what
+        // its commit will be built from. The gate withdraws the claim if it goes
+        // on to refuse the call.
+        this.noteFileWrite(id, writeTargetOf(ev.name, ev.input, run.workdir));
         return;
       case 'tool_result':
         this.events.append({
@@ -525,7 +538,7 @@ export class RunRegistry extends EventEmitter {
 
     if (git && run.baseSha) {
       try {
-        const diff = await git.finishRun(run.baseSha);
+        const diff = await git.finishRun(run.baseSha, [...run.wrote]);
         diffSummary = formatDiffStat(diff);
         if (diff.filesChanged > 0) {
           this.artifacts.write(id, 'changes.diff', diff.patch);
@@ -536,6 +549,18 @@ export class RunRegistry extends EventEmitter {
             source: 'runner',
             summary: `${id} changed ${diffSummary}`,
             data: { filesChanged: diff.filesChanged, insertions: diff.insertions, deletions: diff.deletions, files: diff.files },
+          });
+        }
+        // Said out loud rather than swept in. Anything here is either the
+        // operator's work-in-progress or a change this run made through a shell
+        // command, and neither is something to commit under the run's message.
+        if (diff.unclaimed.length) {
+          this.events.append({
+            runId: id,
+            kind: 'git.diff',
+            source: 'runner',
+            summary: `${id} left ${diff.unclaimed.length} uncommitted file(s) it was not seen to write: ${diff.unclaimed.slice(0, 8).join(', ')}${diff.unclaimed.length > 8 ? '…' : ''}`,
+            data: { unclaimed: diff.unclaimed },
           });
         }
         if (run.base) {
@@ -705,6 +730,27 @@ export class RunRegistry extends EventEmitter {
     return this.active.get(id);
   }
 
+  /**
+   * Record that the gate let this run write a path. The commit is built from
+   * these and nothing else, so a write that never reaches here is a change that
+   * stays in the working tree — which is the safe direction to be wrong in.
+   */
+  noteFileWrite(id: string, path: string): void {
+    if (!path) return;
+    this.active.get(id)?.wrote.add(path);
+  }
+
+  /**
+   * The gate refused the write, so nothing was written and the path is not this
+   * run's to commit. Without this, a denied write to a file the operator happens
+   * to have open would put their edit in the run's commit — the exact thing the
+   * pathspec exists to prevent.
+   */
+  forgetFileWrite(id: string, path: string): void {
+    if (!path) return;
+    this.active.get(id)?.wrote.delete(path);
+  }
+
   activeIds(): string[] {
     return [...this.active.keys()];
   }
@@ -732,6 +778,21 @@ function personaFile(agent?: AgentConfig): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The tools that write a file at a path they name, kept in step with the
+ * write-scope check in `src/policy/policy.ts`. A shell command can write
+ * anything and names nothing, so it claims nothing — its changes stay in the
+ * working tree and get reported rather than committed under this run's message.
+ */
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit']);
+
+function writeTargetOf(tool: string, input: Record<string, unknown>, workdir: string): string {
+  if (!WRITE_TOOLS.has(tool)) return '';
+  const target = String(input?.file_path ?? input?.notebook_path ?? '');
+  if (!target) return '';
+  return isAbsolute(target) ? target : resolve(workdir, target);
 }
 
 function describeTool(name: string, input: Record<string, unknown>): string {

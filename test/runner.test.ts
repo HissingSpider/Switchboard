@@ -108,6 +108,13 @@ describe('end-to-end runs', () => {
     await h.registry.stop();
   });
 
+  /**
+   * Also the guard on path matching: the run reports its writes as absolute
+   * paths from its own cwd, which macOS hands back through /private/var, while
+   * the configured project path is the /var the operator wrote down. Compare
+   * those without resolving symlinks and every path falls outside the repo, so
+   * the run stages nothing and this diff comes back empty.
+   */
   test('a run that writes files lands on its own branch with a diff', async () => {
     const h = harness();
     const run = h.registry.submit({ prompt: 'SCENARIO:write make a file', project: 'proj', channel: 'cli' });
@@ -182,7 +189,7 @@ describe('git wrapper', () => {
     const started = await git.startRun('r-gittest');
     assert.equal(started.branch, 'switchboard/r-gittest');
     writeFileSync(join(dir, 'newfile.txt'), 'hi\n');
-    const diff = await git.finishRun(started.baseSha);
+    const diff = await git.finishRun(started.baseSha, [join(dir, 'newfile.txt')]);
     assert.equal(diff.filesChanged, 1);
     assert.equal(diff.insertions, 1);
     await git.commit('test commit');
@@ -220,7 +227,9 @@ describe('a run never destroys uncommitted work', () => {
     assert.equal(existsSync(mine), false, 'the run should start from a clean tree');
 
     // The run does its own work and commits it to the branch.
-    writeFileSync(join(dir, 'agent-output.txt'), 'what the agent did\n');
+    const agentFile = join(dir, 'agent-output.txt');
+    writeFileSync(agentFile, 'what the agent did\n');
+    await git.finishRun(started.baseSha, [agentFile]);
     await git.commit('the agent’s work');
 
     const restored = await git.restore(started.base, started.stashed);
@@ -246,6 +255,64 @@ describe('a run never destroys uncommitted work', () => {
     assert.match(readFileSync(readme, 'utf8'), /my unsaved edit/);
 
     writeFileSync(readme, original);
+  });
+
+  /**
+   * The bug this file's other tests did not catch: the stash at `startRun`
+   * only closes the door at t=0. The operator keeps working in the same
+   * checkout, and `git add -A` at the end swept those edits into the run's
+   * commit — under the run's message, describing something else entirely.
+   */
+  test('an edit made while the run is going is not swept into its commit', async () => {
+    const dir = box.projectDir;
+    const mine = join(dir, 'CONTRIBUTING.md');
+    const theirs = join(dir, 'agent-wrote-this.txt');
+
+    const git = new GitWrapper(dir);
+    const started = await git.startRun('r-midrun');
+    assert.equal(started.stashed, false, 'the tree was clean when the run began');
+
+    // Both happen during the run: the agent writes its file, the operator —
+    // who has no idea a run is holding this checkout — edits theirs.
+    writeFileSync(theirs, 'agent output\n');
+    writeFileSync(mine, 'my notes, written while the run was going\n');
+
+    const diff = await git.finishRun(started.baseSha, [theirs]);
+    assert.deepEqual(
+      diff.files.map((f) => f.path),
+      ['agent-wrote-this.txt'],
+      'only what the run was seen to write may be staged',
+    );
+    assert.deepEqual(diff.unclaimed, ['CONTRIBUTING.md'], 'and the rest is reported, not committed');
+
+    await git.commit('the agent’s work');
+    const committed = execFileSync('git', ['show', '--stat', '--format=', 'HEAD'], { cwd: dir, encoding: 'utf8' });
+    assert.match(committed, /agent-wrote-this\.txt/);
+    assert.equal(committed.includes('CONTRIBUTING.md'), false, 'the operator’s file must not be in the run’s commit');
+
+    // And it is still there, still theirs, after the run parks back on main.
+    await git.restore(started.base, started.stashed);
+    assert.equal(readFileSync(mine, 'utf8'), 'my notes, written while the run was going\n');
+    assert.equal(existsSync(theirs), false, 'the agent’s work stays on its branch');
+
+    rmSync(mine, { force: true });
+  });
+
+  test('a run that writes nothing commits nothing, however dirty the tree is', async () => {
+    const dir = box.projectDir;
+    const mine = join(dir, 'only-mine.txt');
+    const git = new GitWrapper(dir);
+    const started = await git.startRun('r-midrun2');
+
+    writeFileSync(mine, 'mine alone\n');
+    const diff = await git.finishRun(started.baseSha, []);
+    assert.equal(diff.filesChanged, 0);
+    assert.deepEqual(diff.unclaimed, ['only-mine.txt']);
+    assert.equal(await git.commit('nothing to see'), null, 'an empty index is not a commit');
+
+    await git.restore(started.base, started.stashed);
+    assert.equal(readFileSync(mine, 'utf8'), 'mine alone\n');
+    rmSync(mine, { force: true });
   });
 
   test('a clean tree is not stashed, so nothing is disturbed', async () => {
