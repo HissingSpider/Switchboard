@@ -156,6 +156,12 @@ export interface NativeImessageOptions {
   dbPath?: string;
   /** Where to stage a readable copy when the live database is locked. */
   workDir: string;
+  /**
+   * Remembers how far the reader got, so a restart does not lose whatever was
+   * said while it was down. Optional: without it the reader still works, it
+   * just starts from the newest message as it always did.
+   */
+  cursor?: { read(): number | undefined; write(rowId: number): void };
 }
 
 export class NativeImessageAdapter implements ChannelAdapter {
@@ -240,9 +246,21 @@ export class NativeImessageAdapter implements ChannelAdapter {
       return;
     }
 
-    // Start from the newest message so a fresh install doesn't replay history.
-    const row = this.openDb().prepare('SELECT COALESCE(MAX(ROWID), 0) AS n FROM message').get() as { n: number };
-    this.lastRowId = Number(row.n);
+    // Where the reader left off, if it has run before.
+    //
+    // Starting from `MAX(ROWID)` was the only safe option while the sole
+    // defence against replaying history was a two-minute in-memory echo check:
+    // resuming a stale cursor would have re-answered everything. But it means a
+    // text sent while the daemon is down is silently dropped, and the daemon
+    // restarts — for a deploy, a crash, a reboot — while someone is mid-thought.
+    //
+    // The staleness check makes resuming safe: anything genuinely old is
+    // ignored on its own merits, whether it arrives from a stale cursor or from
+    // a late sync. So the cursor is honoured, and MAX(ROWID) is what a *first*
+    // run falls back to.
+    const newest = Number((this.openDb().prepare('SELECT COALESCE(MAX(ROWID), 0) AS n FROM message').get() as { n: number }).n);
+    const saved = this.opts.cursor?.read();
+    this.lastRowId = saved !== undefined && saved > 0 && saved <= newest ? saved : newest;
 
     const interval = Math.max(500, this.opts.pollMs ?? 1500);
     this.timer = setInterval(() => void this.poll(), interval);
@@ -279,6 +297,9 @@ export class NativeImessageAdapter implements ChannelAdapter {
         delivered.push(msg);
         await this.onMessage?.(msg);
       }
+      // Written after the batch, not before: a message that crashed us mid-way
+      // should be retried on the next boot, not skipped for having been seen.
+      if (rows.length) this.opts.cursor?.write(this.lastRowId);
       this.lastError = null;
     } catch (err) {
       this.lastError = (err as Error).message;

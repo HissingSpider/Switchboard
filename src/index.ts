@@ -162,6 +162,14 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   const nativeImessage = new NativeImessageAdapter(cfg.imessage, {
     pollMs: cfg.imessage.pollMs,
     workDir: join(cfg.resolved.dataDir, 'imessage'),
+    // Survives a restart, so a text sent while the daemon was down still lands.
+    cursor: {
+      read: () => {
+        const v = kvGet(db, 'imessage.lastRowId');
+        return v ? Number(v) : undefined;
+      },
+      write: (rowId) => kvSet(db, 'imessage.lastRowId', String(rowId)),
+    },
   });
   const imessage = useNativeImessage ? nativeImessage : bluebubbles;
   const telegram = new TelegramAdapter(cfg.telegram, attachmentDir);

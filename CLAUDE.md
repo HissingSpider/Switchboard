@@ -42,7 +42,7 @@ reason — don't "fix" the imports back to `src/`.
 
 ```
 src/config     schema + loader        src/store      sqlite, event log, runs, artifacts
-src/runner     claude -p, caps, git   src/policy     tiers, matching, confirm-by-reply
+src/runner     claude -p, caps, git   src/policy     tiers, matching, confirm, standing
 src/router     lanes + pipeline       src/agents     definitions, registry, handoff
 src/skills     SKILL.md loader        src/gateway    HTTP/WS/SSE + hook endpoint
 src/adapters   iMessage, Telegram     src/scheduler  cron + triggers
@@ -98,6 +98,21 @@ public/        dashboard              skills/        starter skills
   127.0.0.1, so loopback-implies-trusted would let a revoked device back in.
 - The skill sandbox can only ever *narrow* a policy decision. It must never turn
   a `confirm` or a `deny` into an `allow`.
+- A standing approval ("always allow", `src/policy/standing.ts`) is the one
+  thing that widens, and it is allowed to because a person clicked it. It is
+  applied only to a `confirm` — never to a deny from the profile, the
+  write-scope check or the sandbox — so the most it can do is skip a question
+  whose answer was going to be yes. `canStand()` is re-checked on *every* match,
+  not just when the rule is granted: otherwise a rule made for `git status`
+  drifts into covering `git push` the first time the model chains differently.
+- A Bash standing rule covers one command, not a chain. `Bash(head *)` matching
+  `head x && rm -rf y` would hand a glob a decision nobody made, so a command
+  containing `&&`, `;`, `|`, a redirection or a substitution never matches a
+  glob rule — it can only ever be granted, and matched, as an exact string.
+- A push notification's approve/deny buttons post to
+  `/api/confirmations/<id>`, so the push cannot be sent before the id exists.
+  That is what `request({ onCreated })` is for. A notification whose buttons
+  404 is worse than no notification, because it looks answered.
 - An obviously read-only call is allowed instead of falling through to
   `confirm` — asking a human whether a schema lookup may proceed buys nothing
   but a 600s timer, and a read cannot leak on its own: getting data *out* needs
@@ -121,6 +136,12 @@ public/        dashboard              skills/        starter skills
 - A fix is verified by re-running the originating check *here*, not by believing
   the run's own summary. `investigations.verifyFix` is what makes "fixed" mean
   something.
+- The iMessage reader resumes from a persisted cursor, so a text sent while the
+  daemon was down is not lost. That is only safe *because* of the staleness
+  check: before it, `MAX(ROWID)` on every boot was the only thing standing
+  between a restart and re-answering the entire history of someone's Messages
+  database. A cursor past the end of the database is ignored — a restored
+  backup would otherwise leave the reader deaf.
 - Starting the iMessage reader at `MAX(ROWID)` stops a fresh install replaying
   history; it does not stop Apple *delivering* history. A message composed days
   ago arrives with a brand-new ROWID when another device finally syncs, and the

@@ -345,3 +345,98 @@ describe('a late sync is not a request', () => {
     assert.deepEqual(seen, ['status']);
   });
 });
+
+describe('a restart does not lose what was said while it was down', () => {
+  /** The kv-backed cursor, in memory. */
+  const fakeCursor = () => {
+    let v: number | undefined;
+    return { read: () => v, write: (n: number) => void (v = n), peek: () => v };
+  };
+
+  test('messages that arrived while the daemon was down are still delivered', async () => {
+    // Before this, `start()` always began at MAX(ROWID): anything texted during
+    // a deploy, a crash or a reboot was silently dropped, mid-conversation.
+    const db = fakeChatDb();
+    const cursor = fakeCursor();
+    const mk = () =>
+      new NativeImessageAdapter(
+        { enabled: true, mode: 'native', allowlist: ['+15550105555'] },
+        { dbPath: db.path, workDir: join(box.root, 'imsg-c'), pollMs: 10_000, cursor },
+      );
+
+    const first = mk();
+    const seen: string[] = [];
+    first.onMessage = (m) => void seen.push(m.text);
+    await first.start();
+    db.insert({ text: 'one', sender: '+15550105555', chat: 'iMessage;-;+15550105555' });
+    await first.poll();
+    await first.stop();
+    assert.deepEqual(seen, ['one']);
+
+    // Daemon is down; the phone keeps texting.
+    db.insert({ text: 'two', sender: '+15550105555', chat: 'iMessage;-;+15550105555' });
+    db.insert({ text: 'three', sender: '+15550105555', chat: 'iMessage;-;+15550105555' });
+
+    const second = mk();
+    const after: string[] = [];
+    second.onMessage = (m) => void after.push(m.text);
+    await second.start();
+    await second.poll();
+    await second.stop();
+    assert.deepEqual(after, ['two', 'three'], 'both survived the restart');
+  });
+
+  test('a first run with no cursor still starts from the newest message', async () => {
+    // The original guarantee: a fresh install must not replay the whole history
+    // of someone's Messages database.
+    const db = fakeChatDb();
+    db.insert({ text: 'ancient history', sender: '+15550105555', chat: 'iMessage;-;+15550105555' });
+    const adapter = new NativeImessageAdapter(
+      { enabled: true, mode: 'native', allowlist: ['+15550105555'] },
+      { dbPath: db.path, workDir: join(box.root, 'imsg-f'), pollMs: 10_000, cursor: fakeCursor() },
+    );
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+    await adapter.poll();
+    assert.deepEqual(seen, [], 'nothing before the first boot is a request');
+  });
+
+  test('a cursor pointing past the end of the database is ignored', async () => {
+    // A restored backup, or a Messages database rebuilt by macOS, leaves the
+    // saved position beyond anything that exists. Trusting it would go deaf.
+    const db = fakeChatDb();
+    const cursor = { read: () => 999_999, write: () => undefined };
+    const adapter = new NativeImessageAdapter(
+      { enabled: true, mode: 'native', allowlist: ['+15550105555'] },
+      { dbPath: db.path, workDir: join(box.root, 'imsg-b'), pollMs: 10_000, cursor },
+    );
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+    db.insert({ text: 'hello again', sender: '+15550105555', chat: 'iMessage;-;+15550105555' });
+    await adapter.poll();
+    assert.deepEqual(seen, ['hello again'], 'falls back to the newest message and keeps working');
+  });
+
+  test('a stale cursor cannot resurrect ancient messages', async () => {
+    // Resuming is only safe because the staleness guard is there: a cursor from
+    // days ago must not re-answer days of history.
+    const db = fakeChatDb();
+    db.insert({
+      text: 'old news',
+      sender: '+15550105555',
+      chat: 'iMessage;-;+15550105555',
+      sentAt: Date.now() - 3 * 24 * 60 * 60_000,
+    });
+    const adapter = new NativeImessageAdapter(
+      { enabled: true, mode: 'native', allowlist: ['+15550105555'] },
+      { dbPath: db.path, workDir: join(box.root, 'imsg-s'), pollMs: 10_000, cursor: { read: () => 1, write: () => undefined } },
+    );
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+    await adapter.poll();
+    assert.deepEqual(seen, [], 'old is old, however we arrive at it');
+  });
+});
