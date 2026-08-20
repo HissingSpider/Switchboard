@@ -21,6 +21,8 @@ export type EventKind =
   | 'action.confirm_requested'
   | 'action.confirm_answered'
   | 'action.denied'
+  | 'policy.standing_granted'
+  | 'policy.standing_revoked'
   // side effects
   | 'git.branch'
   | 'git.diff'

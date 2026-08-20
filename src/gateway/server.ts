@@ -18,6 +18,7 @@ import type { EventLog } from '../store/eventlog.js';
 import type { ArtifactStore } from '../store/artifacts.js';
 import type { SessionStore } from '../store/sessions.js';
 import type { ConfirmService } from '../policy/confirm.js';
+import { suggest as suggestStanding, type StandingRules } from '../policy/standing.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { SkillRegistry } from '../skills/loader.js';
 import type { ImessageAdapter } from '../adapters/imessage.js';
@@ -59,6 +60,7 @@ export interface GatewayDeps {
   artifacts: ArtifactStore;
   registry: RunRegistry;
   confirms: ConfirmService;
+  standing: StandingRules;
   agents: AgentRegistry;
   skills: SkillRegistry;
   pipeline: MessagePipeline;
@@ -275,7 +277,7 @@ export class Gateway {
   // ---------------------------------------------------------------- API
 
   private async api(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-    const { runs, events, registry, artifacts, confirms, agents, skills, cfg } = this.d;
+    const { runs, events, registry, artifacts, confirms, standing, agents, skills, cfg } = this.d;
     const p = url.pathname.replace(/^\/api/, '');
     const method = req.method ?? 'GET';
 
@@ -375,9 +377,33 @@ export class Gateway {
     }
     const confMatch = /^\/confirmations\/([^/]+)$/.exec(p);
     if (confMatch && method === 'POST') {
-      const body = (await readJson(req)) as { approve?: boolean };
+      const body = (await readJson(req)) as { approve?: boolean; always?: boolean };
+      const target = confirms.get(confMatch[1]!);
+      // The rule is granted before the answer so that a run which immediately
+      // asks the same thing again is covered by it. Only on approve: "always
+      // deny" is a profile edit, not something to click through in a hurry.
+      let rule;
+      if (target && body.approve && body.always && target.alwaysSpec) {
+        rule = standing.grant({
+          spec: target.alwaysSpec,
+          mode: target.alwaysMode ?? 'glob',
+          tool: target.tool,
+          by: 'dashboard',
+          origin: target.id,
+          sample: target.detail,
+        });
+      }
       const updated = confirms.answer(confMatch[1]!, Boolean(body.approve), 'dashboard');
-      return updated ? json(res, 200, { confirmation: updated }) : json(res, 404, { error: 'no such pending confirmation' });
+      return updated ? json(res, 200, { confirmation: updated, rule: rule ?? null }) : json(res, 404, { error: 'no such pending confirmation' });
+    }
+
+    if (p === '/rules' && method === 'GET') {
+      return json(res, 200, { rules: standing.list() });
+    }
+    const ruleMatch = /^\/rules\/([^/]+)$/.exec(p);
+    if (ruleMatch && method === 'DELETE') {
+      const revoked = standing.revoke(ruleMatch[1]!, 'dashboard');
+      return revoked ? json(res, 200, { rule: revoked }) : json(res, 404, { error: 'no such rule' });
     }
 
     if (p === '/projects') {
@@ -662,12 +688,24 @@ export class Gateway {
     const sandbox = this.sandboxFor(rec.skill, workdir);
     verdict = applySandbox(verdict, call, sandbox);
 
+    // A standing approval is an answer a person already gave. It is applied only
+    // to a `confirm` — never to a deny from the profile, the write-scope check
+    // or the sandbox — so the widest thing it can do is skip a question whose
+    // answer was going to be yes.
+    let standingRule;
+    if (verdict.tier === 'confirm') {
+      standingRule = this.d.standing.match(call);
+      if (standingRule) {
+        verdict = { tier: 'allow', rule: standingRule.spec, reason: `standing approval ${standingRule.id} granted by you` };
+      }
+    }
+
     this.d.events.append({
       runId,
       kind: 'action.gated',
       source: 'policy',
       summary: `${verdict.tier} ${tool}: ${truncate(argLine(call), 140)} (${verdict.reason})`,
-      data: { tool, input, tier: verdict.tier, rule: verdict.rule, reason: verdict.reason, skill: rec.skill ?? undefined },
+      data: { tool, input, tier: verdict.tier, rule: verdict.rule, reason: verdict.reason, skill: rec.skill ?? undefined, standing: standingRule?.id },
     });
 
     if (verdict.tier === 'allow') return json(res, 200, { decision: 'allow', reason: verdict.reason });
@@ -685,18 +723,23 @@ export class Gateway {
       return json(res, 200, { decision: 'deny', reason: verdict.reason });
     }
 
-    // A confirmation is the one thing worth waking someone for, so it goes out
-    // as a push as well as through the usual notification rules.
-    void this.d.push
-      .sendApprovalRequest(`pending-${runId}`, runId, tool, argLine(call))
-      .catch(() => undefined);
-
+    // Worked out here, where the real call is still in hand: the confirmation row
+    // only keeps `tool` and an argument line, which is not enough to tell a path
+    // from a pattern later.
+    const always = suggestStanding(call, workdir);
     const outcome = await this.d.confirms.request({
       runId,
       tool,
       detail: argLine(call),
       tier: verdict.tier,
       channel: rec.channel,
+      alwaysSpec: always?.spec ?? null,
+      alwaysMode: always?.mode ?? null,
+      // A confirmation is the one thing worth waking someone for, so it goes out
+      // as a push as well as through the usual notification rules.
+      onCreated: (confirmId) => {
+        void this.d.push.sendApprovalRequest(confirmId, runId, tool, argLine(call)).catch(() => undefined);
+      },
     });
     // Timeout defaults to abort — silence is never consent.
     return json(res, 200, {

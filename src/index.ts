@@ -9,6 +9,7 @@ import { RunStore } from './store/runs.js';
 import { SessionStore } from './store/sessions.js';
 import { ArtifactStore } from './store/artifacts.js';
 import { ConfirmService } from './policy/confirm.js';
+import { StandingRules } from './policy/standing.js';
 import { checkPolicyIntegrity } from './policy/policy.js';
 import { RunRegistry } from './runner/registry.js';
 import { FailureMonitor } from './runner/failures.js';
@@ -54,6 +55,7 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   const sessions = new SessionStore(db);
   const artifacts = new ArtifactStore(cfg.resolved.artifactsDir);
   const confirms = new ConfirmService(db, events, cfg.confirmTimeoutSec);
+  const standing = new StandingRules(db, events);
 
   // --- integrity -------------------------------------------------------
   const expected = kvGet(db, 'policy.hash');
@@ -335,6 +337,7 @@ ${diff.slice(0, 8000)}
     artifacts,
     registry,
     confirms,
+    standing,
     agents,
     skills,
     pipeline,

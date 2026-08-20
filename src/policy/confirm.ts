@@ -16,6 +16,13 @@ export interface Confirmation {
   status: ConfirmStatus;
   answeredBy: string | null;
   channel: string | null;
+  /**
+   * The standing rule this answer could be turned into, computed at the gate
+   * where the real tool call is still in hand. Null means "always" is not on
+   * offer for this one, and the dashboard shows no button for it.
+   */
+  alwaysSpec: string | null;
+  alwaysMode: 'glob' | 'exact' | null;
 }
 
 interface Row {
@@ -29,6 +36,8 @@ interface Row {
   status: string;
   answered_by: string | null;
   channel: string | null;
+  always_spec: string | null;
+  always_mode: string | null;
 }
 
 const toConfirm = (r: Row): Confirmation => ({
@@ -42,6 +51,8 @@ const toConfirm = (r: Row): Confirmation => ({
   status: r.status as ConfirmStatus,
   answeredBy: r.answered_by,
   channel: r.channel,
+  alwaysSpec: r.always_spec,
+  alwaysMode: r.always_mode === 'exact' ? 'exact' : r.always_spec ? 'glob' : null,
 });
 
 const YES = /^(y|yes|ok|okay|go|do it|approve|approved|confirm|sure|yep|yeah|👍)$/i;
@@ -80,7 +91,23 @@ export class ConfirmService {
    * Raise a confirmation and wait. Resolves 'approved' | 'denied' | 'timeout'.
    * The prompt is emitted as an event; adapters turn it into a text.
    */
-  async request(input: { runId: string; tool: string; detail: string; tier: string; channel?: string | null; timeoutSec?: number }): Promise<{
+  async request(input: {
+    runId: string;
+    tool: string;
+    detail: string;
+    tier: string;
+    channel?: string | null;
+    timeoutSec?: number;
+    alwaysSpec?: string | null;
+    alwaysMode?: 'glob' | 'exact' | null;
+    /**
+     * Called once the id exists. A push notification carries approve/deny
+     * buttons that post back to `/api/confirmations/<id>`, so it cannot be sent
+     * before there is an id to name — a notification whose buttons 404 is worse
+     * than no notification, because it looks answered.
+     */
+    onCreated?: (id: string) => void;
+  }): Promise<{
     id: string;
     status: ConfirmStatus;
   }> {
@@ -88,12 +115,23 @@ export class ConfirmService {
     const createdAt = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO confirmations (id, run_id, created_at, tool, detail, tier, status, channel)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        `INSERT INTO confirmations (id, run_id, created_at, tool, detail, tier, status, channel, always_spec, always_mode)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
       )
-      .run(id, input.runId, createdAt, input.tool, input.detail, input.tier, input.channel ?? null);
+      .run(
+        id,
+        input.runId,
+        createdAt,
+        input.tool,
+        input.detail,
+        input.tier,
+        input.channel ?? null,
+        input.alwaysSpec ?? null,
+        input.alwaysSpec ? (input.alwaysMode ?? 'glob') : null,
+      );
 
     const timeoutSec = input.timeoutSec ?? this.timeoutSec;
+    input.onCreated?.(id);
     this.log.append({
       runId: input.runId,
       kind: 'action.confirm_requested',
