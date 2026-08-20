@@ -9,19 +9,65 @@ const log = logger('chat');
  *
  * Chat is a catch-all — the router sends anything without a project and without
  * a task or query hint here — so some of what lands is not conversation at all.
- * Rather than guess from the text, the model is given one unambiguous way to
- * say "this needs tools", and that answer costs one cheap turn.
+ * The model is given one unambiguous way to say "this needs tools", and that
+ * answer costs one cheap turn.
  */
 export const ESCALATE = 'NEEDS_TOOLS';
+
+/**
+ * Questions that are about this machine rather than about the world.
+ *
+ * The sentinel alone is not enough, and the failure is quiet rather than loud:
+ * asked to list the scratch directory, a tool-free session answered from the
+ * environment block the CLI puts in its own prompt and was *right*, which is
+ * worse than being wrong because nothing looks broken. A model asked to
+ * self-assess will sometimes decide it knows.
+ *
+ * So the same technique the router already uses decides it first: a cheap rule,
+ * no model call, and a bias toward escalating. Being wrong here costs one
+ * unnecessary query run; being wrong the other way costs a confident answer
+ * about a filesystem nobody read.
+ */
+const NEEDS_TOOLS = [
+  // Anything that names a path, a file, or a repository.
+  /(^|\s)[~./][\w./-]*\/|\b[\w-]+\.(ts|js|tsx|jsx|py|go|rs|java|rb|json|ya?ml|toml|md|txt|css|html|sh|sql|lock)\b/i,
+  // Reading, listing, running, or counting something on disk.
+  /\b(read|open|cat|list|ls|grep|search|find|show me|print|count|diff|log|tail|head|inspect|check)\b.*\b(file|files|dir|directory|folder|repo|repository|branch|commit|code|log|logs|output|contents?)\b/i,
+  /\b(what'?s|whats|what is) in\b/i,
+  // Talking about the machine's own state or the user's own things.
+  /\b(my|the|this|your) (repo|repository|project|codebase|branch|commit|config|settings?|scratch|directory|folder|machine|mac|disk|logs?)\b/i,
+  /\b(how many|how much) .*\b(lines?|files?|commits?|runs?|tests?|errors?)\b/i,
+  // Anything that has to leave the machine to be true.
+  /\b(look up|google|browse|fetch|download|current|latest|today'?s|right now)\b/i,
+  // Running something.
+  /\b(run|execute|npm |git |node |build|deploy|test)\b/i,
+];
+
+/**
+ * Would answering this honestly need something the tool-free session does not
+ * have? Deliberately over-inclusive — see NEEDS_TOOLS.
+ */
+export function needsTools(prompt: string): boolean {
+  return NEEDS_TOOLS.some((re) => re.test(prompt));
+}
 
 const SYSTEM = [
   'You are answering one conversational turn for the person who owns this machine.',
   'Reply in at most three sentences, in plain prose.',
   '',
-  'You have no tools in this session. If answering properly would need reading a',
-  'file, running a command, looking at a repository, or fetching anything, reply',
-  `with exactly ${ESCALATE} and nothing else — the question will be re-asked in a`,
-  'session that has tools. Do not apologise, do not guess, do not explain.',
+  'You have NO tools and NO access to this machine in this session.',
+  '',
+  `Reply with exactly ${ESCALATE}, and nothing else, whenever a truthful answer`,
+  'would depend on something you cannot see: the contents of a file or directory,',
+  'the state of a repository, command output, anything on disk, or anything that',
+  'has changed recently in the world.',
+  '',
+  'This includes cases where you can make a confident guess. Your working',
+  'directory and environment appear in your own context; they are not evidence',
+  `about the machine, and a question about them is still ${ESCALATE}.`,
+  '',
+  'Do not apologise, do not hedge, do not explain the limitation. Either answer',
+  `from general knowledge, or reply ${ESCALATE}.`,
 ].join('\n');
 
 export type ChatOutcome =
@@ -97,6 +143,10 @@ export class ChatResponder {
    */
   async reply(threadId: string, prompt: string): Promise<ChatOutcome> {
     if (!this.enabled) return { kind: 'unavailable' };
+
+    // Decided before the model is asked, because a model asked to judge its own
+    // blind spot sometimes decides it can see.
+    if (needsTools(prompt)) return { kind: 'escalate' };
 
     try {
       let warm = await this.session();

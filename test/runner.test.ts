@@ -11,7 +11,7 @@ import { ArtifactStore } from '../dist/store/artifacts.js';
 import { RunRegistry, BudgetExceededError } from '../dist/runner/registry.js';
 import { ClaudeProcess } from '../dist/runner/claude.js';
 import { modelFor } from '../dist/runner/profiles.js';
-import { ESCALATE } from '../dist/runner/chat.js';
+import { ESCALATE, needsTools } from '../dist/runner/chat.js';
 import { GitWrapper } from '../dist/runner/git.js';
 import { installHook } from '../dist/runner/hook.js';
 import { sandbox, fakeClaudeShim, waitFor, type Sandbox } from './helpers.ts';
@@ -330,7 +330,7 @@ describe('the chat lane answers from a resident session', () => {
     // sentinel — the same shape as a real model declining a tool-free turn.
     const h = harness();
     await h.registry.chat.prewarm();
-    const run = chatRun(h, `${ESCALATE} please read the file`);
+    const run = chatRun(h, `${ESCALATE} please`);
     await waitFor(() => h.runs.get(run.id)?.status === 'done', 20_000);
 
     const started = events(h, run.id).find((e) => e.kind === 'run.started');
@@ -407,7 +407,7 @@ describe('a misrouted chat is promoted, not just spawned', () => {
     const h = harness();
     await h.registry.chat.prewarm();
     const run = h.registry.submit({
-      prompt: `${ESCALATE} read a file for me`,
+      prompt: `${ESCALATE} please`,
       intent: 'chat',
       channel: 'imessage',
       threadId: 'promote',
@@ -419,5 +419,39 @@ describe('a misrouted chat is promoted, not just spawned', () => {
     assert.equal(rec.model, modelFor(h.cfg as never, { intent: 'query' }));
     assert.notEqual(rec.model, modelFor(h.cfg as never, { intent: 'chat' }));
     await h.registry.stop();
+  });
+});
+
+describe('the tool-free lane knows what it cannot answer', () => {
+  test('questions about this machine escalate without asking the model', () => {
+    // The observed failure: asked to list the scratch directory, a tool-free
+    // session answered from its own environment block and happened to be right.
+    for (const q of [
+      'List the files in your scratch directory.',
+      'What is in ~/.switchboard?',
+      'How many lines are in src/runner/registry.ts?',
+      'read CLAUDE.md and summarise it',
+      'what does my config look like',
+      'show me the last commit',
+      'run npm test',
+      'check the logs',
+      'what is the latest version of node',
+    ]) {
+      assert.equal(needsTools(q), true, `should escalate: ${q}`);
+    }
+  });
+
+  test('ordinary conversation is still answered warm', () => {
+    // Over-escalating costs a query run; the rule must not swallow the lane.
+    for (const q of [
+      'how is it going',
+      'thanks, that helped',
+      'what is the difference between a mutex and a semaphore',
+      'explain tail call optimisation',
+      'good morning',
+      'why is TCP slow start called that',
+    ]) {
+      assert.equal(needsTools(q), false, `should stay warm: ${q}`);
+    }
   });
 });
