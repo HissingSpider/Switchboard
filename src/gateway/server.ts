@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { join, extname, normalize } from 'node:path';
+import { join, extname, normalize, isAbsolute, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { LoadedConfig } from '../config/load.js';
@@ -40,6 +40,10 @@ import type { QueueWorker } from '../queue/worker.js';
 import { runChecks, healthFor, formatReport } from '../investigate/health.js';
 
 const log = logger('gateway');
+
+/** The tools that write a file at a path they name. Kept in step with the
+ *  write-scope check in `src/policy/policy.ts`. */
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit']);
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -713,6 +717,7 @@ export class Gateway {
       // Investigation runs stop on the first denial rather than carrying on
       // without the tool: a diagnosis that quietly skipped the step it needed
       // is worse than one that stops and says what it wanted to do.
+      this.forgetWrite(runId, call, workdir);
       if (profile.haltOnDeny) {
         this.d.registry.kill(runId, `halted: tried to ${tool} (${verdict.reason})`);
         return json(res, 200, {
@@ -742,10 +747,26 @@ export class Gateway {
       },
     });
     // Timeout defaults to abort — silence is never consent.
+    if (outcome.status !== 'approved') this.forgetWrite(runId, call, workdir);
     return json(res, 200, {
       decision: outcome.status === 'approved' ? 'allow' : 'deny',
       reason: outcome.status === 'approved' ? `approved by owner (${outcome.id})` : `not approved (${outcome.status})`,
     });
+  }
+
+  /**
+   * Withdraw a write the run claimed but was refused.
+   *
+   * The claim is made when the tool call appears in the run's stream, before the
+   * gate has ruled on it. A denied write never happened, so the path is not this
+   * run's to commit — and if the operator has that same file open, leaving the
+   * claim standing would put their edit in the run's commit.
+   */
+  private forgetWrite(runId: string, call: { tool: string; input: Record<string, unknown> }, workdir: string | undefined): void {
+    if (!WRITE_TOOLS.has(call.tool)) return;
+    const target = String(call.input?.file_path ?? call.input?.notebook_path ?? '');
+    if (!target) return;
+    this.d.registry.forgetFileWrite(runId, isAbsolute(target) ? target : resolvePath(workdir ?? '.', target));
   }
 
   /** Build the sandbox context for a skill-scoped run, if it is one. */
