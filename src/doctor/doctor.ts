@@ -6,6 +6,7 @@ import type { LoadedConfig } from '../config/load.js';
 import { resolveMcpSet, serverNames } from '../runner/mcp.js';
 import { resolveRef, looksLikeRawSecret } from '../secrets/keychain.js';
 import { checkPolicyIntegrity } from '../policy/policy.js';
+import { readCredentialClock } from '../runner/credentials.js';
 import { isRepo } from '../runner/git.js';
 import { SkillRegistry } from '../skills/loader.js';
 import { parseCron } from '../scheduler/cron.js';
@@ -105,11 +106,24 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
       .then(() => true)
       .catch(() => false);
     if (hasApiKey || hasCreds || hasKeychainLogin) {
-      add({
-        name: 'claude auth',
-        status: 'ok',
-        detail: hasApiKey ? 'ANTHROPIC_API_KEY set' : hasCreds ? 'logged in (~/.claude/.credentials.json)' : 'logged in (Keychain)',
-      });
+      const where = hasApiKey ? 'ANTHROPIC_API_KEY set' : hasCreds ? 'logged in (~/.claude/.credentials.json)' : 'logged in (Keychain)';
+      // "A credential exists" is not the same as "a credential works", and the
+      // difference is not academic: three scheduled runs died on an expired
+      // login while this check stayed green. The refresh token is the one that
+      // needs a human — the access token renews itself.
+      const clock = readCredentialClock();
+      const refreshDead = clock.refreshExpiresAt !== undefined && clock.refreshExpiresAt < Date.now();
+      if (refreshDead) {
+        add({
+          name: 'claude auth',
+          status: 'fail',
+          detail: `stored login expired ${new Date(clock.refreshExpiresAt!).toLocaleString()} — runs will fail`,
+          fix: 'run `claude` on this machine and log in again',
+        });
+      } else {
+        const expiry = clock.refreshExpiresAt ? `, valid until ${new Date(clock.refreshExpiresAt).toLocaleDateString()}` : '';
+        add({ name: 'claude auth', status: 'ok', detail: `${where}${expiry}` });
+      }
     } else {
       add({
         name: 'claude auth',

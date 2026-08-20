@@ -50,8 +50,11 @@ for (const btn of document.querySelectorAll('nav button')) {
 // ----------------------------------------------------------------- status
 async function refreshStatus() {
   const s = await api('/api/status');
-  $('#summary').textContent =
-    `${s.active}/${s.capacity} running · ${s.queued} queued · $${s.monthSpendUsd.toFixed(2)}/$${s.monthBudgetUsd} this month · ${s.skills} skills`;
+  const summary = `${s.active}/${s.capacity} running · ${s.queued} queued · $${s.monthSpendUsd.toFixed(2)}/$${s.monthBudgetUsd} this month · ${s.skills} skills`;
+  // A halt is the only thing worth reading when there is one: "0 running" is
+  // true and useless if nothing *can* run.
+  $('#summary').textContent = s.halted ? `⚠ ${s.halted.message} ${s.halted.remedy}` : summary;
+  $('#summary').classList.toggle('halted', Boolean(s.halted));
   await refreshConfirmations();
 }
 

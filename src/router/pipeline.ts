@@ -3,7 +3,7 @@ import type { LoadedConfig } from '../config/load.js';
 import { routeMessage, HELP_TEXT, type Command } from './intent.js';
 import { listProjects } from './projects.js';
 import type { RunRegistry } from '../runner/registry.js';
-import { BudgetExceededError } from '../runner/registry.js';
+import { BudgetExceededError, HaltedError } from '../runner/registry.js';
 import type { RunStore } from '../store/runs.js';
 import type { SessionStore } from '../store/sessions.js';
 import type { EventLog } from '../store/eventlog.js';
@@ -112,6 +112,12 @@ export class MessagePipeline {
         await this.say(msg.threadId, `on it${where} — ${run.id}`);
       }
     } catch (err) {
+      if (err instanceof HaltedError) {
+        // The remedy is the whole message. Repeating "couldn't start that"
+        // in front of it just delays the sentence that helps.
+        await this.say(msg.threadId, err.message);
+        return;
+      }
       if (err instanceof BudgetExceededError) {
         await this.say(msg.threadId, `can't start: ${err.message}. Raise caps.monthlyBudgetUsd to continue.`);
         return;

@@ -12,6 +12,7 @@ import { decide } from '../policy/policy.js';
 import { applySandbox, type SandboxContext } from '../skills/sandbox.js';
 import { argLine } from '../policy/match.js';
 import type { RunRegistry } from '../runner/registry.js';
+import { HaltedError, BudgetExceededError } from '../runner/registry.js';
 import type { RunStore } from '../store/runs.js';
 import type { EventLog } from '../store/eventlog.js';
 import type { ArtifactStore } from '../store/artifacts.js';
@@ -260,6 +261,12 @@ export class Gateway {
       if (path === '/events') return this.sse(req, res, url);
       return this.static(res, path);
     } catch (err) {
+      // A halt or an exhausted budget is a true statement about the daemon, not
+      // a bug in the request. 503 says "not now, and here is why" — a 500 would
+      // send the dashboard looking for a crash that did not happen.
+      if (err instanceof HaltedError || err instanceof BudgetExceededError) {
+        return json(res, 503, { error: (err as Error).message, halted: err instanceof HaltedError });
+      }
       log.error('request failed', { path, err: (err as Error).message });
       json(res, 500, { error: (err as Error).message });
     }
@@ -279,6 +286,10 @@ export class Gateway {
         agents: agents.all().map((a) => a.name),
         skills: skills.all().length,
         pendingConfirmations: confirms.pending().length,
+        // Null unless the daemon has stopped accepting work. A dashboard that
+        // shows "0 running" during a halt is telling the truth and hiding the
+        // only thing worth knowing.
+        halted: registry.haltGate?.() ?? null,
         version: '0.1.0',
       });
     }

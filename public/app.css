@@ -413,3 +413,7 @@ dialog pre { margin: 0; padding: 12px; overflow: auto; max-height: 70vh; font-fa
 
   .say { font-size: 15.5px; line-height: 1.6; }
 }
+
+/* A halted daemon replaces the status line — it is the only fact that matters
+   until it is fixed. */
+.summary.halted { color: var(--bad); font-weight: 600; }

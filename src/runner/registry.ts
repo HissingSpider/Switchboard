@@ -55,6 +55,8 @@ export interface ActiveRun {
 
 export class BudgetExceededError extends Error {}
 export class ProjectBusyError extends Error {}
+/** Nothing can run: no auth, no credit. Every queued run would hit it too. */
+export class HaltedError extends Error {}
 
 /**
  * The thing that actually runs work.
@@ -89,6 +91,19 @@ export class RunRegistry extends EventEmitter {
   /** The resident chat session, exposed so the daemon can warm it on boot. */
   readonly chat: ChatResponder;
 
+  /**
+   * Asked before every run starts, and again on the sweeper.
+   *
+   * A halting failure — no auth, no credit — is true for every queued run, not
+   * just the one that hit it. Without this the daemon knew it was broken and
+   * kept spending slots proving it: three scheduled runs died on the same
+   * expired login, minutes apart, each one a fresh process and a fresh failure
+   * event. Set by the daemon, which owns the FailureMonitor.
+   */
+  haltGate: (() => { message: string; remedy: string } | null) | null = null;
+  /** Asked on the sweeper to see whether a halt has fixed itself. */
+  haltRecheck: (() => boolean) | null = null;
+
   start(): void {
     this.sweeper = setInterval(() => this.sweep(), 15_000);
     this.sweeper.unref();
@@ -112,6 +127,9 @@ export class RunRegistry extends EventEmitter {
   }
 
   submit(input: SubmitRunInput): RunRecord {
+    const halt = this.haltGate?.();
+    if (halt) throw new HaltedError(`${halt.message} ${halt.remedy}`.trim());
+
     const spent = this.runs.monthSpend();
     if (spent >= this.cfg.caps.monthlyBudgetUsd) {
       throw new BudgetExceededError(
@@ -588,6 +606,10 @@ export class RunRegistry extends EventEmitter {
 
   /** Cost, wall-clock and idleness caps, checked out-of-band from the stream. */
   private sweep(): void {
+    // Cheap and local: reads a stored expiry, spends nothing, and un-halts the
+    // daemon the moment someone logs back in.
+    if (this.haltGate?.()) this.haltRecheck?.();
+
     for (const run of [...this.active.values()]) {
       const id = run.record.id;
       const rec = this.runs.get(id);

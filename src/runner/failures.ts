@@ -1,6 +1,7 @@
 import type { EventLog } from '../store/eventlog.js';
 import type { RunStore, RunRecord } from '../store/runs.js';
 import type { ArtifactStore } from '../store/artifacts.js';
+import { readCredentialClock } from './credentials.js';
 
 export type FailureKind =
   | 'credit_exhausted'
@@ -139,6 +140,15 @@ export function diagnose(run: RunRecord, stderr = '', result = ''): Diagnosis {
  */
 export class FailureMonitor {
   private halted: Diagnosis | null = null;
+  /**
+   * The credential's expiry as it stood when we gave up.
+   *
+   * A halt on expired auth is the one that fixes itself: someone logs in on the
+   * Mac Mini and the stored token's expiry moves forward. Watching for that is
+   * free and exact, so the daemon does not need a human to tell it the thing it
+   * can see for itself — and does not need to spend a run finding out.
+   */
+  private authExpiryAtHalt: number | null = null;
 
   constructor(
     private readonly events: EventLog,
@@ -161,6 +171,7 @@ export class FailureMonitor {
 
     if (diagnosis.halt && !this.halted) {
       this.halted = diagnosis;
+      this.authExpiryAtHalt = diagnosis.kind === 'auth_expired' ? (readCredentialClock().expiresAt ?? 0) : null;
       this.events.append({
         runId: null,
         kind: 'system.error',
@@ -176,8 +187,39 @@ export class FailureMonitor {
     return this.halted;
   }
 
+  /**
+   * Has the thing we halted on been fixed? Called on the sweeper.
+   *
+   * Only expired auth is checked, because it is the only halt with a signal we
+   * can read for nothing. Exhausted credit has no local evidence at all, so it
+   * stays a human's job rather than a guess dressed up as recovery.
+   */
+  recheck(): boolean {
+    if (this.halted?.kind !== 'auth_expired') return false;
+    const clock = readCredentialClock();
+
+    // An explicit API key is not something we can watch expire; if one has
+    // appeared since the halt, that is a deliberate act and reason enough.
+    const fixed =
+      clock.source === 'env' ||
+      (clock.expiresAt !== undefined && clock.expiresAt > (this.authExpiryAtHalt ?? 0) && clock.expiresAt > Date.now());
+    if (!fixed) return false;
+
+    this.halted = null;
+    this.authExpiryAtHalt = null;
+    this.events.append({
+      runId: null,
+      kind: 'system.start',
+      source: 'runner',
+      summary: 'Claude auth works again — accepting runs',
+      data: { recovered: true, source: clock.source },
+    });
+    return true;
+  }
+
   clear(): void {
     this.halted = null;
+    this.authExpiryAtHalt = null;
     this.events.append({ runId: null, kind: 'system.start', source: 'runner', summary: 'halt cleared — accepting runs again', data: {} });
   }
 

@@ -98,6 +98,10 @@ export async function boot(cfgOverride?: LoadedConfig): Promise<Daemon> {
   const registry = new RunRegistry(cfg, events, runs, sessions, artifacts, hookTok);
   const failures = new FailureMonitor(events, runs, artifacts);
   registry.on('finished', (rec) => failures.inspect(rec));
+  // The monitor knows the daemon is broken; the registry is what has to act on
+  // it. Wired here rather than imported, so neither has to know about the other.
+  registry.haltGate = () => failures.haltReason;
+  registry.haltRecheck = () => failures.recheck();
   registry.start();
 
   const agents = new AgentRegistry(cfg, join(cfg.resolved.dataDir, 'agents'));

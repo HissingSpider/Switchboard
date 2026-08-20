@@ -8,7 +8,9 @@ import { EventLog } from '../dist/store/eventlog.js';
 import { RunStore } from '../dist/store/runs.js';
 import { SessionStore } from '../dist/store/sessions.js';
 import { ArtifactStore } from '../dist/store/artifacts.js';
-import { RunRegistry, BudgetExceededError } from '../dist/runner/registry.js';
+import { RunRegistry, BudgetExceededError, HaltedError } from '../dist/runner/registry.js';
+import { FailureMonitor } from '../dist/runner/failures.js';
+import { setCredentialClockForTest } from '../dist/runner/credentials.js';
 import { ClaudeProcess } from '../dist/runner/claude.js';
 import { modelFor } from '../dist/runner/profiles.js';
 import { ESCALATE, needsTools } from '../dist/runner/chat.js';
@@ -453,5 +455,77 @@ describe('the tool-free lane knows what it cannot answer', () => {
     ]) {
       assert.equal(needsTools(q), false, `should stay warm: ${q}`);
     }
+  });
+});
+
+describe('a halted daemon stops spending', () => {
+  const halt = { message: 'Claude auth is no longer valid.', remedy: 'Log in again.' };
+
+  test('submit refuses while halted, with the remedy', () => {
+    // Before this, the daemon knew it was broken and kept proving it: three
+    // scheduled runs died on the same expired login, minutes apart.
+    const h = harness();
+    h.registry.haltGate = () => halt;
+    assert.throws(() => h.registry.submit({ prompt: 'anything', project: 'proj', channel: 'schedule' }), HaltedError);
+    try {
+      h.registry.submit({ prompt: 'anything', channel: 'cli' });
+    } catch (err) {
+      assert.match((err as Error).message, /auth is no longer valid/);
+      assert.match((err as Error).message, /Log in again/);
+    }
+    assert.equal(h.runs.list({ limit: 10 }).length, 0, 'no row is written for work that cannot run');
+  });
+
+  test('clearing the halt lets work through again', async () => {
+    const h = harness();
+    let halted: typeof halt | null = halt;
+    h.registry.haltGate = () => halted;
+    assert.throws(() => h.registry.submit({ prompt: 'x', project: 'proj', channel: 'cli' }), HaltedError);
+    halted = null;
+    const run = h.registry.submit({ prompt: 'now it works', project: 'proj', channel: 'cli' });
+    await waitFor(() => h.runs.get(run.id)?.status === 'done');
+    await h.registry.stop();
+  });
+});
+
+describe('expired auth un-halts itself', () => {
+  const authFailure = {
+    id: 'r-auth',
+    status: 'failed',
+    turns: 0,
+    exitCode: 1,
+    error: 'Invalid API key · Please run /login',
+  } as never;
+
+  test('a halt lifts when the stored credential expiry moves forward', () => {
+    // The one halt with a free, exact signal: someone logs in on the Mac Mini
+    // and the token's expiry advances. No probe, no spend, no waiting to be told.
+    const db = openDb(join(box.root, `halt-${Math.random().toString(36).slice(2)}.db`));
+    const monitor = new FailureMonitor(new EventLog(db), new RunStore(db), new ArtifactStore(box.cfg.resolved.artifactsDir));
+
+    let expiresAt = Date.now() - 60_000;
+    setCredentialClockForTest(() => ({ expiresAt, source: 'keychain' }));
+    try {
+      monitor.inspect(authFailure);
+      assert.ok(monitor.haltReason, 'an expired login halts the daemon');
+      assert.equal(monitor.recheck(), false, 'still broken, still halted');
+
+      expiresAt = Date.now() + 60 * 60_000;
+      assert.equal(monitor.recheck(), true, 'a fresh login lifts the halt');
+      assert.equal(monitor.haltReason, null);
+    } finally {
+      setCredentialClockForTest(null);
+    }
+  });
+
+  test('a halt with no local evidence stays a human decision', () => {
+    // Exhausted credit cannot be observed from here, and guessing at recovery
+    // would just burn a run to rediscover it.
+    const db = openDb(join(box.root, `halt2-${Math.random().toString(36).slice(2)}.db`));
+    const monitor = new FailureMonitor(new EventLog(db), new RunStore(db), new ArtifactStore(box.cfg.resolved.artifactsDir));
+    monitor.inspect({ id: 'r-credit', status: 'failed', turns: 0, exitCode: 1, error: 'Credit balance is too low' } as never);
+    assert.equal(monitor.haltReason?.kind, 'credit_exhausted');
+    assert.equal(monitor.recheck(), false);
+    assert.ok(monitor.haltReason, 'only a human clears this one');
   });
 });

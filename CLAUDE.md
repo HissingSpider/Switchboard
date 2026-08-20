@@ -121,6 +121,15 @@ public/        dashboard              skills/        starter skills
 - A fix is verified by re-running the originating check *here*, not by believing
   the run's own summary. `investigations.verifyFix` is what makes "fixed" mean
   something.
+- A halting failure — no auth, no credit — is true for every queued run, not
+  just the one that hit it. `registry.haltGate` refuses new work while it
+  stands, because a daemon that knows it is broken must not keep spending slots
+  proving it. Expired auth lifts its own halt by watching the stored
+  credential's expiry move forward; exhausted credit has no local evidence, so
+  it stays a human's decision rather than a guess dressed up as recovery.
+- "A credential exists" is not "a credential works". Doctor's auth check stayed
+  green through three failed scheduled runs. The access token renews itself; the
+  *refresh* token expiring is what needs a person, so that is what is checked.
 - The queue claims a card on the board *before* submitting the run. A crashed
   daemon must leave a card visibly stuck in progress, never silently back in the
   backlog for a second worker.
