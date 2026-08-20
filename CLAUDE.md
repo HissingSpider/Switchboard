@@ -81,6 +81,18 @@ public/        dashboard              skills/        starter skills
   127.0.0.1, so loopback-implies-trusted would let a revoked device back in.
 - The skill sandbox can only ever *narrow* a policy decision. It must never turn
   a `confirm` or a `deny` into an `allow`.
+- An obviously read-only call is allowed instead of falling through to
+  `confirm` — asking a human whether a schema lookup may proceed buys nothing
+  but a 600s timer, and a read cannot leak on its own: getting data *out* needs
+  an outbound action, and those are caught above every profile. It applies
+  **only when the profile's fallback is `confirm`**. `fallback: deny` means no
+  and stays no; a built-in must never widen a profile that closed itself.
+- An MCP tool's name is the only evidence of what it does, so `isObviouslyReadOnly`
+  matches whole words, not prefixes: the name must start with a read verb and
+  contain no mutating one. `get_settings` is a read (`set` is inside a word);
+  `search_and_replace` is not. A name that says nothing — `start_session` —
+  stays gated, and belongs in a profile's `allow` list where the server-specific
+  knowledge lives.
 - `trusted` is the only trust tier a machine cannot grant itself, and that is
   the point. Nothing a skill does is evidence it should be allowed to send,
   publish, push or delete.

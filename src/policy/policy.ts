@@ -43,6 +43,69 @@ export const HARD_DENY: Array<{ spec: string; label: string }> = [
   { spec: 'Bash(*launchctl unload*)', label: 'unload system services' },
 ];
 
+/**
+ * Tools that cannot change anything, and therefore should never cost a
+ * confirmation.
+ *
+ * The justification for ungating a read is narrow and worth stating: a read
+ * cannot leak on its own. Getting data *out* needs an outbound action — send,
+ * post, publish, a POST body — and every one of those is caught by
+ * IRREVERSIBLE_PATTERNS above any profile. So the gate belongs on what leaves,
+ * not on what is looked at, and asking a human whether a schema lookup may
+ * proceed buys nothing but a 600-second timer.
+ */
+const INERT_TOOLS = new Set(['read', 'grep', 'glob', 'notebookread', 'toolsearch', 'listmcpresources', 'readmcpresource']);
+
+/**
+ * An MCP tool name is the only evidence we have about what it does, so treating
+ * a leading verb as proof is a guess. These two lists make the guess safe: the
+ * name must *start* with a read verb and contain no mutating one, so
+ * `get_settings` passes and `search_and_replace` does not.
+ */
+const MCP_READ_VERBS = new Set([
+  'get', 'list', 'search', 'read', 'query', 'find', 'fetch',
+  'describe', 'inspect', 'recall', 'view', 'count', 'browse', 'lookup', 'status',
+]);
+
+const MCP_MUTATING_WORDS = new Set([
+  'create', 'update', 'delete', 'remove', 'write', 'set', 'add', 'insert', 'put',
+  'post', 'send', 'patch', 'edit', 'replace', 'move', 'rename', 'archive',
+  'publish', 'deploy', 'buy', 'pay', 'merge', 'push', 'upload', 'revoke',
+  'grant', 'install', 'run', 'exec', 'kill', 'stop', 'start', 'reset', 'clear',
+  'purge', 'drop', 'import', 'sync', 'apply', 'approve', 'assign', 'cancel',
+  'invite', 'share', 'restore', 'seed', 'mark', 'manage', 'upsert', 'record',
+]);
+
+/**
+ * Split `mcp__deerdawn__get_project_map` into ['get','project','map'].
+ *
+ * Words, not substrings: `get_settings` contains "set" and would otherwise be
+ * read as a mutation of settings.
+ */
+function mcpNameWords(tool: string): string[] | undefined {
+  const m = /^mcp__[^_]+(?:_[^_]+)*?__(.+)$/.exec(tool);
+  const bare = m?.[1] ?? (tool.startsWith('mcp__') ? tool.split('__').slice(2).join('_') : undefined);
+  if (!bare) return undefined;
+  return bare
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .split(/[_\-]+/)
+    .filter(Boolean)
+    .map((w) => w.toLowerCase());
+}
+
+/**
+ * Is this call a read that no profile author would have wanted to be asked
+ * about? Deliberately conservative: anything ambiguous answers false and takes
+ * the profile's own fallback.
+ */
+export function isObviouslyReadOnly(call: ToolCall): boolean {
+  if (INERT_TOOLS.has(call.tool.toLowerCase())) return true;
+  const words = mcpNameWords(call.tool);
+  if (!words?.length) return false;
+  if (!MCP_READ_VERBS.has(words[0]!)) return false;
+  return !words.some((w) => MCP_MUTATING_WORDS.has(w));
+}
+
 export interface PolicyContext {
   profile: PermissionProfile;
   /** Absolute path the run is scoped to. Writes outside it are denied. */
@@ -91,7 +154,18 @@ export function decide(call: ToolCall, ctx: PolicyContext): PolicyDecision {
   const allowed = anyMatch(ctx.profile.allow ?? [], call);
   if (allowed) return { tier: 'allow', rule: allowed, reason: 'allowed by permission profile' };
 
-  return { tier: ctx.profile.fallback ?? 'confirm', rule: 'fallback', reason: 'no rule matched' };
+  // 6. An unlisted read, on a profile that asks about the unexpected.
+  //
+  // Only when the fallback is `confirm`. That fallback means "check with me
+  // about things I did not anticipate", and a schema lookup is not what it was
+  // guarding. `fallback: deny` means no, and stays no — a built-in must never
+  // widen a profile that closed itself.
+  const fallback = ctx.profile.fallback ?? 'confirm';
+  if (fallback === 'confirm' && isObviouslyReadOnly(call)) {
+    return { tier: 'allow', rule: 'read-only', reason: 'read-only: cannot change anything, and reads cannot leak on their own' };
+  }
+
+  return { tier: fallback, rule: 'fallback', reason: 'no rule matched' };
 }
 
 /**

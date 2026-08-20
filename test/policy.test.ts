@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, HARD_DENY } from '../dist/policy/policy.js';
+import { decide, HARD_DENY, isObviouslyReadOnly } from '../dist/policy/policy.js';
 import { specMatches, argLine, parseSpec } from '../dist/policy/match.js';
 import { parseConfirmReply } from '../dist/policy/confirm.js';
 import { DEFAULT_PERMISSION_PROFILES } from '../dist/config/schema.js';
@@ -100,5 +100,65 @@ describe('confirm replies', () => {
   test('ignores anything that is not an answer', () => {
     assert.equal(parseConfirmReply('fix the login bug'), undefined);
     assert.equal(parseConfirmReply('yes, but only the first part'), undefined);
+  });
+});
+
+describe('read-only calls do not cost a confirmation', () => {
+  const call = (tool: string, input: Record<string, unknown> = {}) => ({ tool, input });
+  const assistant = DEFAULT_PERMISSION_PROFILES.find((p) => p.name === 'assistant')!;
+
+  test('a schema lookup is allowed rather than queued for a human', () => {
+    // The observed failure: `needs approval: ToolSearch — no rule matched`,
+    // then a 600-second timer, for loading a tool definition.
+    const d = decide(call('ToolSearch', { query: 'select:Read' }), { profile: assistant });
+    assert.equal(d.tier, 'allow');
+    assert.equal(d.rule, 'read-only');
+  });
+
+  test('MCP reads are recognised by their leading verb', () => {
+    for (const name of ['mcp__dd__get_context', 'mcp__dd__list_projects', 'mcp__dd__search_context', 'mcp__dd__find_known_paths']) {
+      assert.equal(decide(call(name), { profile: assistant }).tier, 'allow', name);
+    }
+  });
+
+  test('a read verb on a mutating name is not a read', () => {
+    // `search*` alone would let this through; the whole-name check is the point.
+    assert.equal(isObviouslyReadOnly(call('mcp__x__search_and_replace')), false);
+    assert.equal(isObviouslyReadOnly(call('mcp__x__list_and_delete')), false);
+    assert.equal(isObviouslyReadOnly(call('mcp__x__get_or_create')), false);
+  });
+
+  test('matching is on words, not substrings', () => {
+    // "get_settings" contains "set"; reading it as a mutation would gate every
+    // settings read on the machine.
+    assert.equal(isObviouslyReadOnly(call('mcp__x__get_settings')), true);
+    assert.equal(isObviouslyReadOnly(call('mcp__x__getSettings')), true);
+  });
+
+  test('a name that does not advertise itself as a read stays gated', () => {
+    // Honest limit: only the name is evidence, and this one says nothing.
+    assert.equal(isObviouslyReadOnly(call('mcp__dd__start_session')), false);
+    assert.equal(isObviouslyReadOnly(call('mcp__x__do_the_thing')), false);
+  });
+
+  test('a profile that closed itself is not widened', () => {
+    // `fallback: deny` means no. A built-in must never turn that into yes.
+    assert.equal(decide(call('mcp__dd__get_context'), { profile: readonly }).tier, 'deny');
+    assert.equal(decide(call('ToolSearch'), { profile: readonly }).tier, 'deny');
+  });
+
+  test('an explicit deny still beats the read-only rule', () => {
+    const strict = { ...coding, deny: [...coding.deny, 'ToolSearch'] };
+    assert.equal(decide(call('ToolSearch'), { profile: strict }).tier, 'deny');
+  });
+
+  test('an explicit confirm still beats the read-only rule', () => {
+    const cautious = { ...coding, confirm: [...coding.confirm, 'mcp__*__get*'] };
+    assert.equal(decide(call('mcp__dd__get_context'), { profile: cautious }).tier, 'confirm');
+  });
+
+  test('an irreversible shape is never reclassified as a read', () => {
+    assert.equal(isObviouslyReadOnly(call('mcp__x__send_email')), false);
+    assert.equal(decide(call('mcp__x__send_email'), { profile: coding }).tier, 'confirm');
   });
 });
