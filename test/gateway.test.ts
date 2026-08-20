@@ -8,6 +8,7 @@ import { RunStore } from '../dist/store/runs.js';
 import { SessionStore } from '../dist/store/sessions.js';
 import { ArtifactStore } from '../dist/store/artifacts.js';
 import { ConfirmService } from '../dist/policy/confirm.js';
+import { StandingRules } from '../dist/policy/standing.js';
 import { RunRegistry } from '../dist/runner/registry.js';
 import { AgentRegistry } from '../dist/agents/registry.js';
 import { SkillRegistry } from '../dist/skills/loader.js';
@@ -34,6 +35,7 @@ function build() {
   const sessions = new SessionStore(db);
   const artifacts = new ArtifactStore(cfg.resolved.artifactsDir);
   const confirms = new ConfirmService(db, events, 2); // 2s timeout keeps tests quick
+  const standing = new StandingRules(db, events);
   const registry = new RunRegistry(cfg as never, events, runs, sessions, artifacts, HOOK_TOKEN);
   registry.start();
   const agents = new AgentRegistry(cfg, join(cfg.resolved.dataDir, 'agents'));
@@ -53,7 +55,7 @@ function build() {
   const devices = new DeviceStore(db);
   const push = new PushService(db, events);
   const skillStore = new SkillStore(db);
-  return { cfg, db, events, runs, sessions, artifacts, confirms, registry, agents, skills, pipeline, replies, devices, push, skillStore };
+  return { cfg, db, events, runs, sessions, artifacts, confirms, standing, registry, agents, skills, pipeline, replies, devices, push, skillStore };
 }
 
 before(async () => {
@@ -176,6 +178,53 @@ describe('PreToolUse gate', () => {
     const audit = ctx.confirms.audit(10).find((c) => c.id === id)!;
     assert.equal(audit.status, 'approved');
     assert.equal(audit.answeredBy, 'test');
+  });
+
+  test('"always allow" turns one answer into a rule the next call rides on', async () => {
+    ctx.runs.create({ id: 'r-gate5', prompt: 'x', project: 'proj', projectPath: box.projectDir });
+    // `head` is not in the coding profile's allow list, so it falls through to
+    // the profile's `confirm` fallback — which is the case the button exists for.
+    const call = { runId: 'r-gate5', tool: 'Bash', input: { command: 'head -20 src/x.ts' } };
+    const first = post(HOOK_PATH, call, HOOK_TOKEN);
+    await waitFor(() => ctx.confirms.pending('r-gate5').length === 1, 3000);
+    const conf = ctx.confirms.pending('r-gate5')[0]!;
+    assert.equal(conf.alwaysSpec, 'Bash(head*)');
+
+    const answered = (await (await post(`/api/confirmations/${conf.id}`, { approve: true, always: true })).json()) as {
+      rule: { spec: string } | null;
+    };
+    assert.equal(answered.rule?.spec, 'Bash(head*)');
+    assert.equal(((await (await first).json()) as { decision: string }).decision, 'allow');
+
+    // The same shape now goes straight through, and says so in the log.
+    const again = (await (await post(HOOK_PATH, call, HOOK_TOKEN)).json()) as { decision: string; reason: string };
+    assert.equal(again.decision, 'allow');
+    assert.match(again.reason, /standing approval/);
+    assert.equal(ctx.confirms.pending('r-gate5').length, 0);
+  });
+
+  test('a standing rule never covers what is gated by shape', async () => {
+    ctx.runs.create({ id: 'r-gate6', prompt: 'x', project: 'proj', projectPath: box.projectDir });
+    ctx.standing.grant({ spec: 'Bash(git*)', mode: 'glob', tool: 'Bash', by: 'test' });
+    const body = (await (
+      await post(HOOK_PATH, { runId: 'r-gate6', tool: 'Bash', input: { command: 'git push origin main' } }, HOOK_TOKEN)
+    ).json()) as { decision: string; reason: string };
+    // It still asked, timed out, and failed closed.
+    assert.equal(body.decision, 'deny');
+    assert.match(body.reason, /timeout/);
+  });
+
+  test('a standing rule can be revoked, and stops applying', async () => {
+    ctx.runs.create({ id: 'r-gate7', prompt: 'x', project: 'proj', projectPath: box.projectDir });
+    const rule = ctx.standing.grant({ spec: 'Bash(wc*)', mode: 'glob', tool: 'Bash', by: 'test' })!;
+    const call = { runId: 'r-gate7', tool: 'Bash', input: { command: 'wc -l src/x.ts' } };
+    assert.equal(((await (await post(HOOK_PATH, call, HOOK_TOKEN)).json()) as { decision: string }).decision, 'allow');
+
+    await fetch(`${base}/api/rules/${rule.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${TOKEN}` } });
+    const after = post(HOOK_PATH, call, HOOK_TOKEN);
+    await waitFor(() => ctx.confirms.pending('r-gate7').length === 1, 3000);
+    ctx.confirms.answer(ctx.confirms.pending('r-gate7')[0]!.id, false, 'test');
+    assert.equal(((await (await after).json()) as { decision: string }).decision, 'deny');
   });
 
   test('every gated action lands in the event log', () => {

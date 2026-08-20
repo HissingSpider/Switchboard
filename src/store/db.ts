@@ -222,6 +222,32 @@ CREATE INDEX IF NOT EXISTS idx_findings_inv ON findings(investigation, id);
   // defaults change, and "what did this actually cost, and on what" has to stay
   // answerable for runs that happened under the old config.
   { version: 4, sql: `ALTER TABLE runs ADD COLUMN model TEXT;` },
+  // Standing approvals: "always allow this shape", granted by a person from a
+  // confirmation they were already being asked about. Revocation is a tombstone
+  // rather than a delete, because "what was I allowing last Tuesday" has to stay
+  // answerable after the rule is gone.
+  {
+    version: 5,
+    sql: `
+CREATE TABLE IF NOT EXISTS standing_rules (
+  id           TEXT PRIMARY KEY,
+  created_at   TEXT NOT NULL,
+  created_by   TEXT NOT NULL,
+  tool         TEXT NOT NULL,
+  spec         TEXT NOT NULL,
+  mode         TEXT NOT NULL DEFAULT 'glob',   -- glob|exact
+  origin       TEXT,                           -- the confirmation that prompted it
+  sample       TEXT,                           -- the argument line it was granted for
+  uses         INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  revoked_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_standing_live ON standing_rules(revoked_at);
+
+ALTER TABLE confirmations ADD COLUMN always_spec TEXT;
+ALTER TABLE confirmations ADD COLUMN always_mode TEXT;
+`,
+  },
 ];
 
 export function openDb(path: string): Db {

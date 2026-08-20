@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#0f1115" />
+    <meta name="theme-color" content="#0b0d12" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Switchboard" />
@@ -15,9 +15,12 @@
   </head>
   <body>
     <header>
-      <h1>Switchboard</h1>
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <h1>Switchboard</h1>
+      </div>
       <div id="summary" class="summary">connecting…</div>
-      <nav>
+      <nav aria-label="Sections">
         <button data-tab="live" class="active">Live</button>
         <button data-tab="inbox">Inbox<span id="inbox-badge" class="badge" hidden>0</span></button>
         <button data-tab="history">History</button>
@@ -28,36 +31,43 @@
       </nav>
     </header>
 
-    <div id="offline" class="offline" hidden>offline — reconnecting</div>
+    <div id="offline" class="offline" hidden>Offline — reconnecting…</div>
 
     <main>
       <!-- LIVE ------------------------------------------------------- -->
       <section id="tab-live" class="tab active">
-        <form id="submit" class="submit">
-          <textarea id="prompt" rows="2" placeholder="what should it do?  (⌘↵ to send)"></textarea>
+        <form id="submit" class="submit panel">
+          <textarea id="prompt" rows="2" placeholder="What should it do?  (⌘↵ to send)"></textarea>
           <div class="row">
-            <select id="project"><option value="">no project (scratch)</option></select>
-            <select id="agent"><option value="">default agent</option></select>
-            <select id="class">
-              <option value="">auto</option>
-              <option value="coding">coding</option>
-              <option value="assistant">assistant</option>
-              <option value="computer-use">computer-use</option>
+            <select id="project" aria-label="Project"><option value="">No project (scratch)</option></select>
+            <select id="agent" aria-label="Agent"><option value="">Default agent</option></select>
+            <select id="class" aria-label="Task class">
+              <option value="">Auto</option>
+              <option value="coding">Coding</option>
+              <option value="assistant">Assistant</option>
+              <option value="computer-use">Computer use</option>
             </select>
-            <button type="submit">Run</button>
-            <a class="linkbtn" href="/voice.html">Voice</a>
+            <span class="spacer"></span>
+            <a class="btn btn-ghost" href="/voice.html">Voice</a>
+            <button type="submit" class="btn btn-primary">Run</button>
           </div>
         </form>
 
         <div class="split">
-          <aside id="runlist" class="runlist"></aside>
-          <div class="stream">
-            <div id="runhead" class="runhead">pick a run</div>
+          <aside class="runlist-wrap">
+            <div class="listhead">
+              <span class="eyebrow">Runs</span>
+              <span id="runcount" class="dim"></span>
+            </div>
+            <div id="runlist" class="runlist"></div>
+          </aside>
+          <div class="stream panel">
+            <div id="runhead" class="runhead"><span class="dim">Pick a run</span></div>
             <div id="events" class="events"></div>
             <form id="followup" class="followup" hidden>
-              <input id="followtext" placeholder="say something to this run…" />
-              <button type="submit">Send</button>
-              <button type="button" id="killbtn" class="danger">Kill</button>
+              <input id="followtext" placeholder="Say something to this run…" />
+              <button type="submit" class="btn btn-primary">Send</button>
+              <button type="button" id="killbtn" class="btn btn-danger">Kill</button>
             </form>
           </div>
         </div>
@@ -65,34 +75,46 @@
 
       <!-- INBOX ------------------------------------------------------ -->
       <section id="tab-inbox" class="tab">
-        <p class="hint">Anything waiting on you. Approvals time out and abort — silence is never consent.</p>
+        <div class="pagehead">
+          <h2>Inbox</h2>
+          <p class="hint">
+            Anything waiting on you. Approvals time out and abort — silence is never consent.
+            <b>Always allow</b> turns one answer into a standing rule you can revoke under Setup.
+          </p>
+        </div>
         <div id="inbox"></div>
         <h3 class="section">Recently answered</h3>
-        <div id="inbox-audit"></div>
+        <div id="inbox-audit" class="panel pad"></div>
       </section>
 
       <!-- HISTORY ---------------------------------------------------- -->
       <section id="tab-history" class="tab">
-        <div class="row">
-          <input id="search" placeholder="search prompts, results, ids…" />
-          <select id="filter-status">
-            <option value="">any status</option>
-            <option>done</option>
-            <option>failed</option>
-            <option>killed</option>
-            <option>running</option>
-          </select>
-          <select id="filter-project"><option value="">any project</option></select>
+        <div class="pagehead">
+          <h2>History</h2>
         </div>
-        <div class="scrollx"><table id="history"></table></div>
+        <div class="row toolbar">
+          <input id="search" class="grow" placeholder="Search prompts, results, ids…" />
+          <select id="filter-status" aria-label="Status">
+            <option value="">Any status</option>
+            <option value="done">Done</option>
+            <option value="failed">Failed</option>
+            <option value="killed">Killed</option>
+            <option value="running">Running</option>
+          </select>
+          <select id="filter-project" aria-label="Project"><option value="">Any project</option></select>
+        </div>
+        <div class="panel scrollx"><table id="history"></table></div>
       </section>
 
       <!-- SKILLS ----------------------------------------------------- -->
       <section id="tab-skills" class="tab">
-        <p class="hint">
-          Skills the machine wrote for itself start sandboxed and earn their way up. Only you can grant
-          <b>trusted</b> — the tier that may ask to send, publish, push or delete.
-        </p>
+        <div class="pagehead">
+          <h2>Skills</h2>
+          <p class="hint">
+            Skills the machine wrote for itself start sandboxed and earn their way up. Only you can grant
+            <b>trusted</b> — the tier that may ask to send, publish, push or delete.
+          </p>
+        </div>
         <div id="skills-review"></div>
         <h3 class="section">All skills</h3>
         <div id="skills-all"></div>
@@ -100,6 +122,7 @@
 
       <!-- BOARD ------------------------------------------------------ -->
       <section id="tab-board" class="tab">
+        <div class="pagehead"><h2>Board</h2></div>
         <div id="board" class="board"></div>
       </section>
 
@@ -110,13 +133,14 @@
 
       <!-- SETUP ------------------------------------------------------ -->
       <section id="tab-setup" class="tab">
+        <div class="pagehead"><h2>Setup</h2></div>
         <div class="board">
           <div class="col">
             <h3>This device</h3>
             <div id="push-state" class="card">checking…</div>
             <div class="row">
-              <button id="enable-push">Enable notifications</button>
-              <button id="test-push">Send a test</button>
+              <button id="enable-push" class="btn">Enable notifications</button>
+              <button id="test-push" class="btn btn-ghost">Send a test</button>
             </div>
             <p class="hint">
               On iPhone this only works once Switchboard is added to the Home Screen — Share → Add to Home Screen,
@@ -126,7 +150,7 @@
           <div class="col">
             <h3>Pair a device</h3>
             <div id="pair-code" class="card">—</div>
-            <div class="row"><button id="new-pair">New pairing code</button></div>
+            <div class="row"><button id="new-pair" class="btn">New pairing code</button></div>
             <p class="hint">On the new device open <code>/pair.html</code> and type the code. Codes last 5 minutes.</p>
           </div>
           <div class="col">
@@ -138,12 +162,22 @@
             <div id="reach" class="card">checking…</div>
           </div>
         </div>
+
+        <h3 class="section">Standing approvals</h3>
+        <p class="hint">
+          Every rule here is one you granted from a confirmation. A rule can only ever skip a question whose answer
+          was going to be yes — it never overrides a denial, and never covers anything that pushes, publishes,
+          sends, buys or deletes. Those still ask, every time.
+        </p>
+        <div id="rules"></div>
+
+        <h3 class="section">Configuration</h3>
         <div id="config"></div>
       </section>
     </main>
 
     <dialog id="diffbox">
-      <header><strong id="difftitle">diff</strong><button id="diffclose">close</button></header>
+      <header><strong id="difftitle">diff</strong><button id="diffclose" class="btn btn-ghost">Close</button></header>
       <pre id="diff"></pre>
     </dialog>
 
