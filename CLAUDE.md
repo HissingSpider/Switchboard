@@ -63,7 +63,24 @@ public/        dashboard              skills/        starter skills
 - Exit code 143 is our own SIGTERM, not a crash. `killedIntentionally` is what
   keeps a kill from being reported as a failure.
 - The per-project lock is not an optimisation. Two agents on one repo at the
-  same time produces a merge conflict inside a working tree with no merge.
+  same time produces a merge conflict inside a working tree with no merge. It
+  is taken at the very top of `launch()`, before the first `await`: any
+  suspension point ahead of it is long enough for the next `drain()` to start a
+  second run in the same project.
+- Only the chat lane may be served from the resident session, and the reason is
+  the gate rather than the model: `hook.ts` reads `SWB_RUN_ID` from its own
+  process environment, so a process shared between runs would attribute every
+  gated call to whichever run started it. A shared process is safe only where
+  nothing is gated at all, which is what `allowedTools: []` buys. Adding a tool
+  to `ChatResponder` silently corrupts the audit trail.
+- `total_cost_usd` on a `result` is the running total for the whole session, not
+  the turn that just ended. `WarmSession` bills the delta; charging the field
+  directly makes a resident process re-bill everything it has ever said, on
+  every turn, and empties the monthly budget at a multiple of the real rate.
+- A chat turn that answers `NEEDS_TOOLS` is promoted to the query lane *and its
+  model* before being spawned. Escalating the tools without the model leaves a
+  tool-using question on the cheapest tier, which is how a small model ends up
+  looping on a tool call.
 - macOS Screen Recording and Accessibility grants are per-binary and cached per
   process. After granting either, the daemon must restart.
 - `config.json` must live outside every project path. Startup refuses to boot if

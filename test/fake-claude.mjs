@@ -33,6 +33,14 @@ function promptFrom() {
 let prompt = interactive ? '' : promptFrom();
 
 /**
+ * The real CLI reports `total_cost_usd` as the running total for the whole
+ * session, not for the turn that just ended. A fake that reported a flat
+ * per-turn cost would let a resident session re-bill its whole history without
+ * any test noticing.
+ */
+let sessionCostUsd = 0;
+
+/**
  * Interactive mode is a loop, not a single turn: the warm session used by the
  * voice pipeline sends many prompts down one stdin and expects a `result` per
  * turn. A single-shot fake would make every warm-session test pass for the
@@ -113,7 +121,7 @@ async function respond(prompt) {
     is_error: false,
     duration_ms: 120,
     num_turns: turns,
-    total_cost_usd: prompt.includes('SCENARIO:expensive') ? 999 : 0.0123,
+    total_cost_usd: (sessionCostUsd += prompt.includes('SCENARIO:expensive') ? 999 : 0.0123),
     result: `done: ${prompt.slice(0, 80)}`,
     usage: { input_tokens: 100 * turns, output_tokens: 50 * turns },
   });

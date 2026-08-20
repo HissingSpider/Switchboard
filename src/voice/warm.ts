@@ -45,6 +45,16 @@ export class WarmSession extends EventEmitter {
   private starting: Promise<void> | null = null;
   sessionId: string | null = null;
   totalCostUsd = 0;
+  /**
+   * What we have already charged someone for.
+   *
+   * `total_cost_usd` on a `result` is the running total for the whole session,
+   * not the turn that just ended. Billing it directly means a resident process
+   * re-bills every word it has ever said, on every turn — the reported cost of
+   * a two-line answer climbs all session, and the monthly budget empties at a
+   * multiple of the real rate.
+   */
+  private billedCostUsd = 0;
 
   constructor(private readonly opts: WarmSessionOptions) {
     super();
@@ -84,7 +94,7 @@ export class WarmSession extends EventEmitter {
         if (ev.type === 'init') {
           this.sessionId = ev.sessionId;
         } else if (ev.type === 'result') {
-          this.totalCostUsd += ev.costUsd;
+          this.totalCostUsd = ev.costUsd;
           proc.off('event', onEvent);
           this.starting = null;
           resolve();
@@ -134,8 +144,13 @@ export class WarmSession extends EventEmitter {
         } else if (ev.type === 'result') {
           proc.off('event', onEvent);
           this.busy = false;
-          this.totalCostUsd += ev.costUsd;
-          resolve({ text: full || ev.text, costUsd: ev.costUsd, ms: Date.now() - started });
+          // Charge the difference, not the running total. The warm-up turn is
+          // unbilled until now, so the first real answer carries it — which is
+          // honest: nothing else asked for that process to exist.
+          const turnCost = Math.max(0, ev.costUsd - this.billedCostUsd);
+          this.billedCostUsd = ev.costUsd;
+          this.totalCostUsd = ev.costUsd;
+          resolve({ text: full || ev.text, costUsd: turnCost, ms: Date.now() - started });
         } else if (ev.type === 'exit') {
           proc.off('event', onEvent);
           this.busy = false;
@@ -170,6 +185,11 @@ export class WarmSession extends EventEmitter {
     this.stop();
     this.turns = 0;
     this.sessionId = null;
+    // A fresh process is a fresh session: its `total_cost_usd` restarts at
+    // zero, so the high-water mark has to as well or every turn after a
+    // recycle bills nothing.
+    this.billedCostUsd = 0;
+    this.totalCostUsd = 0;
     await this.start();
   }
 

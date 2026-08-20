@@ -6,6 +6,7 @@ import type { AgentConfig, TaskClass } from '../config/schema.js';
 import { ClaudeProcess, type ClaudeEvent } from './claude.js';
 import { GitWrapper, isRepo, formatDiffStat } from './git.js';
 import { executionProfile, effectiveCaps, modelFor } from './profiles.js';
+import { ChatResponder } from './chat.js';
 import { resolveMcpSet, writeMcpConfig, setNameFor } from './mcp.js';
 import { installHook, HOOK_PATH } from './hook.js';
 import type { EventLog } from '../store/eventlog.js';
@@ -82,7 +83,11 @@ export class RunRegistry extends EventEmitter {
   ) {
     super();
     this.hook = installHook(cfg.resolved.dataDir);
+    this.chat = new ChatResponder(cfg);
   }
+
+  /** The resident chat session, exposed so the daemon can warm it on boot. */
+  readonly chat: ChatResponder;
 
   start(): void {
     this.sweeper = setInterval(() => this.sweep(), 15_000);
@@ -91,6 +96,7 @@ export class RunRegistry extends EventEmitter {
 
   async stop(): Promise<void> {
     if (this.sweeper) clearInterval(this.sweeper);
+    this.chat.stop();
     for (const id of [...this.active.keys()]) this.kill(id, 'daemon shutting down');
     // Give children a beat to die before the process exits.
     await new Promise((r) => setTimeout(r, 500));
@@ -184,7 +190,95 @@ export class RunRegistry extends EventEmitter {
     }
   }
 
+  /**
+   * A short conversational turn does not need a process of its own. Answering
+   * from the resident session skips the CLI cold start, which is most of the
+   * latency of a reply that was never going to touch a repo.
+   *
+   * The run record and the events are identical either way — the dashboard,
+   * the iMessage downsample and the cost panel are all reads of the event log,
+   * and must not be able to tell which path served a turn.
+   */
+  private async tryWarmChat(record: RunRecord): Promise<boolean> {
+    // A project means a repo, and a repo means tools. Only the tool-free case
+    // is safe to serve from a shared process — see ChatResponder.
+    if (record.intent !== 'chat' || record.project) return false;
+
+    const outcome = await this.chat.reply(record.threadId ?? record.id, record.prompt);
+
+    if (outcome.kind === 'escalate') {
+      // The router called this chat; the model says it needs tools. Promote it
+      // to the query lane before spawning, or a question that needs a repo runs
+      // on the cheapest model with no lane of its own — which is how a
+      // tool-using turn ends up looping on the small model.
+      const model = modelFor(this.cfg, { intent: 'query' }) ?? null;
+      this.runs.update(record.id, { intent: 'query', model });
+      // launch() spawns from the in-memory record it was handed, so the row and
+      // the object have to move together or the process still gets chat's model.
+      Object.assign(record, { intent: 'query', model });
+      this.events.append({
+        runId: record.id,
+        kind: 'run.progress',
+        source: 'runner',
+        summary: `${record.id} needs tools — promoted from chat to the query lane${model ? ` (${model})` : ''}`,
+        data: { from: 'chat', to: 'query', model },
+      });
+      return false;
+    }
+    if (outcome.kind !== 'answered') return false;
+    const reply = outcome;
+
+    const startedAt = new Date().toISOString();
+    this.runs.update(record.id, { status: 'running', startedAt });
+    this.events.append({
+      runId: record.id,
+      kind: 'run.started',
+      source: 'runner',
+      summary: `${record.id} started (warm chat session)`,
+      data: { workdir: this.cfg.resolved.scratchDir, warm: true },
+    });
+    this.events.append({
+      runId: record.id,
+      kind: 'agent.text',
+      source: 'agent',
+      summary: reply.text.slice(0, 200),
+      data: { text: reply.text },
+    });
+    this.finishWarm(record, reply.costUsd, reply.ms, reply.text);
+    return true;
+  }
+
+  private finishWarm(record: RunRecord, costUsd: number, ms: number, text: string): void {
+    this.runs.update(record.id, {
+      status: 'done',
+      finishedAt: new Date().toISOString(),
+      costUsd,
+      turns: 1,
+      result: text,
+    });
+    this.events.append({
+      runId: record.id,
+      kind: 'run.finished',
+      source: 'runner',
+      summary: `${record.id} done in ${(ms / 1000).toFixed(1)}s — $${costUsd.toFixed(3)}`,
+      // `result` is what the iMessage downsampler relays back, so the answer
+      // reaches the person who asked. Omitting it sends them a timing line.
+      data: { costUsd, ms, warm: true, result: text, status: 'done', turns: 1 },
+    });
+    // No drain() here: this runs inside the drain loop, which continues on its
+    // own once launch() returns.
+    this.emit('finished', this.runs.get(record.id));
+  }
+
   private async launch(record: RunRecord): Promise<void> {
+    // Take the per-project lock before the first `await`. Two agents in one
+    // repo is a merge conflict inside a working tree with no merge, and every
+    // suspension point here is long enough for the next drain() to start a
+    // second run in the same project.
+    if (record.project) this.projectLocks.add(record.project);
+
+    if (await this.tryWarmChat(record)) return;
+
     const agent = this.agentByName(record.agent ?? undefined);
     const project = record.project ? findProject(this.cfg, record.project) : undefined;
     const exec = executionProfile(record.taskClass);
@@ -195,8 +289,6 @@ export class RunRegistry extends EventEmitter {
     const permissionProfileName =
       this.profileOverrides.get(record.id) ?? agent?.permissionProfile ?? project?.permissionProfile ?? exec.defaultPermissionProfile;
     const permProfile = profileFor(this.cfg, permissionProfileName);
-
-    if (record.project) this.projectLocks.add(record.project);
 
     // Branch per run, but only for real repos that opted in.
     let branch: string | undefined;

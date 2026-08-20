@@ -350,6 +350,10 @@ ${diff.slice(0, 8000)}
   // Deliberately not awaited: warming the model and the STT weights takes a
   // few seconds and nothing else needs to wait for it.
   void voice.prewarm();
+  // Same bargain as voice: pay the CLI cold start once, at boot, rather than on
+  // the first message. Not awaited — a failed warm-up only means chat spawns
+  // per message, which is what it did before.
+  void registry.chat.prewarm();
 
   events.append({
     runId: null,

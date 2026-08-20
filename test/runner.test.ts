@@ -11,6 +11,7 @@ import { ArtifactStore } from '../dist/store/artifacts.js';
 import { RunRegistry, BudgetExceededError } from '../dist/runner/registry.js';
 import { ClaudeProcess } from '../dist/runner/claude.js';
 import { modelFor } from '../dist/runner/profiles.js';
+import { ESCALATE } from '../dist/runner/chat.js';
 import { GitWrapper } from '../dist/runner/git.js';
 import { installHook } from '../dist/runner/hook.js';
 import { sandbox, fakeClaudeShim, waitFor, type Sandbox } from './helpers.ts';
@@ -280,5 +281,143 @@ describe('model tiering', () => {
 
   test('no models configured at all leaves every lane on the CLI default', () => {
     assert.equal(modelFor({} as never, { intent: 'chat' }), undefined);
+  });
+});
+
+describe('the chat lane answers from a resident session', () => {
+  const events = (h: ReturnType<typeof harness>, id: string) => h.events.replay({ runId: id, limit: 200 });
+  const chatRun = (h: ReturnType<typeof harness>, prompt: string, threadId = 't1') =>
+    h.registry.submit({ prompt, intent: 'chat', channel: 'imessage', threadId });
+
+  test('a conversational turn is served without spawning a run process', async () => {
+    const h = harness();
+    await h.registry.chat.prewarm();
+    const run = chatRun(h, 'how is it going');
+    await waitFor(() => h.runs.get(run.id)?.status === 'done');
+
+    const started = events(h, run.id).find((e) => e.kind === 'run.started');
+    assert.equal(started?.data.warm, true, 'served from the warm session');
+    await h.registry.stop();
+  });
+
+  test('the run record and the event log look the same either way', async () => {
+    // The dashboard, the cost panel and the iMessage downsample are all reads
+    // of the event log. None of them may be able to tell which path served a
+    // turn, so the same events have to be there in the same order.
+    const h = harness();
+    await h.registry.chat.prewarm();
+    const run = chatRun(h, 'say something');
+    await waitFor(() => h.runs.get(run.id)?.status === 'done');
+
+    const kinds = events(h, run.id).map((e) => e.kind);
+    for (const required of ['run.queued', 'run.started', 'agent.text', 'run.finished']) {
+      assert.ok(kinds.includes(required), `missing ${required} — got ${kinds.join(', ')}`);
+    }
+    const rec = h.runs.get(run.id)!;
+    assert.equal(rec.status, 'done');
+    assert.ok(rec.result && rec.result.length > 0, 'the answer is on the record');
+    assert.ok(rec.finishedAt, 'finished, not left open');
+
+    // The downsampler relays `result` off the finished event; without it the
+    // person who asked gets a timing line instead of an answer.
+    const finished = events(h, run.id).find((e) => e.kind === 'run.finished');
+    assert.equal(finished?.data.result, rec.result);
+    await h.registry.stop();
+  });
+
+  test('a question that needs tools falls back to a spawned run', async () => {
+    // The fake echoes the prompt, so this reply carries the escalation
+    // sentinel — the same shape as a real model declining a tool-free turn.
+    const h = harness();
+    await h.registry.chat.prewarm();
+    const run = chatRun(h, `${ESCALATE} please read the file`);
+    await waitFor(() => h.runs.get(run.id)?.status === 'done', 20_000);
+
+    const started = events(h, run.id).find((e) => e.kind === 'run.started');
+    assert.notEqual(started?.data.warm, true, 'escalated to a real run');
+    await h.registry.stop();
+  });
+
+  test('a chat run inside a project is never served warm', async () => {
+    // A project means a repo, which means tools, which means gating — and the
+    // hook reads SWB_RUN_ID from the process, so a shared process would
+    // attribute the call to the wrong run.
+    const h = harness();
+    await h.registry.chat.prewarm();
+    const run = h.registry.submit({ prompt: 'hi there', intent: 'chat', project: 'proj', channel: 'cli' });
+    await waitFor(() => h.runs.get(run.id)?.status === 'done', 20_000);
+    const started = events(h, run.id).find((e) => e.kind === 'run.started');
+    assert.notEqual(started?.data.warm, true);
+    await h.registry.stop();
+  });
+
+  test('two threads do not read each other', async () => {
+    // One resident process is one conversation. A thread switch has to recycle,
+    // or an iMessage thread can see what was said on the dashboard.
+    const h = harness();
+    await h.registry.chat.prewarm();
+    const a = chatRun(h, 'first thread', 'thread-a');
+    await waitFor(() => h.runs.get(a.id)?.status === 'done');
+    const b = chatRun(h, 'second thread', 'thread-b');
+    await waitFor(() => h.runs.get(b.id)?.status === 'done', 20_000);
+
+    assert.match(h.runs.get(a.id)!.result ?? '', /first thread/);
+    assert.match(h.runs.get(b.id)!.result ?? '', /second thread/);
+    await h.registry.stop();
+  });
+
+  test('with no chat model configured nothing is warmed', async () => {
+    const h = harness({ models: {} });
+    assert.equal(h.registry.chat.enabled, false);
+    const run = chatRun(h, 'hello');
+    await waitFor(() => h.runs.get(run.id)?.status === 'done', 20_000);
+    const started = events(h, run.id).find((e) => e.kind === 'run.started');
+    assert.notEqual(started?.data.warm, true);
+    await h.registry.stop();
+  });
+});
+
+describe('a resident session bills each turn once', () => {
+  test('cost is the turn, not the running total', async () => {
+    // `total_cost_usd` climbs for the life of the session. Billing it whole
+    // would re-charge every earlier turn and drain the monthly budget at a
+    // multiple of the real rate.
+    const h = harness();
+    await h.registry.chat.prewarm();
+
+    const costs: number[] = [];
+    for (const text of ['one', 'two', 'three']) {
+      const run = h.registry.submit({ prompt: text, intent: 'chat', channel: 'imessage', threadId: 'billing' });
+      await waitFor(() => h.runs.get(run.id)?.status === 'done', 20_000);
+      costs.push(h.runs.get(run.id)!.costUsd);
+    }
+
+    assert.ok(costs.every((c) => c > 0), `every turn costs something: ${costs.join(', ')}`);
+    // The later turns must not each carry the whole session's history.
+    assert.ok(costs[2]! <= costs[1]! + 1e-9, `cost must not climb per turn: ${costs.join(', ')}`);
+    assert.ok(costs[1]! <= costs[0]! + 1e-9, `cost must not climb per turn: ${costs.join(', ')}`);
+    await h.registry.stop();
+  });
+});
+
+describe('a misrouted chat is promoted, not just spawned', () => {
+  test('needing tools moves the run to the query lane and its model', async () => {
+    // Escalating without changing the model leaves a tool-using question on the
+    // cheapest model, which is how a small model ends up looping on a tool.
+    const h = harness();
+    await h.registry.chat.prewarm();
+    const run = h.registry.submit({
+      prompt: `${ESCALATE} read a file for me`,
+      intent: 'chat',
+      channel: 'imessage',
+      threadId: 'promote',
+    });
+    await waitFor(() => h.runs.get(run.id)?.status === 'done', 20_000);
+
+    const rec = h.runs.get(run.id)!;
+    assert.equal(rec.intent, 'query');
+    assert.equal(rec.model, modelFor(h.cfg as never, { intent: 'query' }));
+    assert.notEqual(rec.model, modelFor(h.cfg as never, { intent: 'chat' }));
+    await h.registry.stop();
   });
 });
