@@ -121,6 +121,26 @@ public/        dashboard              skills/        starter skills
 - A fix is verified by re-running the originating check *here*, not by believing
   the run's own summary. `investigations.verifyFix` is what makes "fixed" mean
   something.
+- Recall (`src/store/recall.ts`) is a *read* of the event log and must stay one.
+  No index, no embeddings, no second table that can disagree with the first —
+  anything it cannot answer from the log it does not answer.
+- What recall hands the model is fenced and framed as background, never as
+  instruction. A past `result` is text a model wrote, so replaying it unfenced
+  into a later system prompt is one run giving orders to the next. It escalates
+  nothing — every action is still gated at the runner — so the cost of getting
+  it wrong is a wasted run, and the fence is what keeps it to that.
+- Recall is only as good as the log, and the log has junk in it: notifications
+  echoed back in as prompts, runs someone killed by hand, failures that never
+  reached the model, and errors this codebase wrote about itself. Each is
+  excluded for its own reason. A killed run is not a rejected approach, and
+  "claude exited with code 1" is not a fact about the project.
+- One shared word is a coincidence, not a match. Two terms is the bar unless the
+  question only has one, and words match on a four-character prefix so "drift"
+  finds "drifting" without anyone owning a stemmer.
+- **Do not point a `coding`-profile run at the repo you are editing.** It
+  branches and stashes, so your uncommitted work vanishes mid-edit and comes
+  back when the run ends. The stash is the safety net working exactly as
+  designed — but commit first, or use a read-only lane.
 - A warm turn needs a ceiling. `WarmSession` resolves on `result` or `exit`, so
   a process that stays alive and says nothing never settles — and an unbounded
   wait strands the run in `queued`, where `sweep()` cannot cap it and `kill()`

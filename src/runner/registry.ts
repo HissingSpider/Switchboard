@@ -9,6 +9,7 @@ import { executionProfile, effectiveCaps, modelFor } from './profiles.js';
 import { ChatResponder } from './chat.js';
 import { resolveMcpSet, writeMcpConfig, setNameFor } from './mcp.js';
 import { installHook, HOOK_PATH } from './hook.js';
+import { recall } from '../store/recall.js';
 import type { EventLog } from '../store/eventlog.js';
 import type { RunStore, RunRecord, Intent, Channel } from '../store/runs.js';
 import type { SessionStore } from '../store/sessions.js';
@@ -348,7 +349,26 @@ export class RunRegistry extends EventEmitter {
     );
     const mcpConfigPath = writeMcpConfig(runDir, mcpServers);
 
-    const systemPrompt = [exec.systemNote, agent?.persona, personaFile(agent)].filter(Boolean).join('\n\n');
+    // What this project already worked out, read back from the event log. Only
+    // for runs with a repo to have a history in, and only for work — a
+    // conversational turn has no use for last week's diff.
+    const memory =
+      record.project && record.intent !== 'chat'
+        ? recall(this.runs, this.events, { project: record.project, prompt: record.prompt, excludeRunId: record.id })
+        : { runs: [], failures: [], text: '' };
+    if (memory.text) {
+      // Recorded so a run's context is inspectable after the fact: "why did it
+      // think that" is unanswerable if what it was told is not in the log.
+      this.events.append({
+        runId: record.id,
+        kind: 'run.progress',
+        source: 'runner',
+        summary: `${record.id} recalled ${memory.runs.length} earlier run(s)${memory.failures.length ? ` and ${memory.failures.length} failure(s)` : ''}`,
+        data: { recalled: memory.runs.map((r) => r.id), failures: memory.failures.map((f) => f.id), chars: memory.text.length },
+      });
+    }
+
+    const systemPrompt = [exec.systemNote, agent?.persona, personaFile(agent), memory.text].filter(Boolean).join('\n\n');
 
     const proc = new ClaudeProcess({
       bin: this.cfg.claudeBin,
