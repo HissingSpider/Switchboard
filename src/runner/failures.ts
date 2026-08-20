@@ -171,7 +171,15 @@ export class FailureMonitor {
 
     if (diagnosis.halt && !this.halted) {
       this.halted = diagnosis;
-      this.authExpiryAtHalt = diagnosis.kind === 'auth_expired' ? (readCredentialClock().expiresAt ?? 0) : null;
+      this.authExpiryAtHalt = null;
+      // Captured off to the side: inspect() runs on the 'finished' event and
+      // must not wait on the Keychain to record that the daemon is broken.
+      // recheck() refuses to clear anything until the snapshot lands.
+      if (diagnosis.kind === 'auth_expired') {
+        void readCredentialClock().then((clock) => {
+          this.authExpiryAtHalt = clock.expiresAt ?? 0;
+        });
+      }
       this.events.append({
         runId: null,
         kind: 'system.error',
@@ -194,16 +202,27 @@ export class FailureMonitor {
    * can read for nothing. Exhausted credit has no local evidence at all, so it
    * stays a human's job rather than a guess dressed up as recovery.
    */
-  recheck(): boolean {
+  async recheck(): Promise<boolean> {
     if (this.halted?.kind !== 'auth_expired') return false;
-    const clock = readCredentialClock();
+    // No snapshot yet means no baseline to compare against, and clearing on an
+    // absent baseline would un-halt on any readable credential at all.
+    if (this.authExpiryAtHalt === null) return false;
+    const clock = await readCredentialClock();
 
-    // An explicit API key is not something we can watch expire; if one has
-    // appeared since the halt, that is a deliberate act and reason enough.
-    const fixed =
-      clock.source === 'env' ||
-      (clock.expiresAt !== undefined && clock.expiresAt > (this.authExpiryAtHalt ?? 0) && clock.expiresAt > Date.now());
+    // An expiry that has moved forward is the whole signal: someone logged in,
+    // or the CLI refreshed. Nothing else counts.
+    //
+    // In particular an API key does not. `process.env` is fixed for the life of
+    // the daemon, so treating "a key is present" as recovery makes the check
+    // true from the instant of the halt onward — a revoked key would halt and
+    // un-halt every sweep, spawning a run each time, which is the exact waste
+    // the halt exists to stop. A bad key is cleared by a human or a restart.
+    const fixed = clock.expiresAt !== undefined && clock.expiresAt > this.authExpiryAtHalt && clock.expiresAt > Date.now();
     if (!fixed) return false;
+
+    // Re-read under the same tick: `halted` could have been cleared by a human
+    // while the Keychain read was in flight.
+    if (!this.halted) return false;
 
     this.halted = null;
     this.authExpiryAtHalt = null;

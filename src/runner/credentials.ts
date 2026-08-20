@@ -1,7 +1,10 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+const exec = promisify(execFile);
 
 /**
  * When the stored Claude credential expires — and nothing else about it.
@@ -43,7 +46,15 @@ export function setCredentialClockForTest(fn: (() => CredentialClock) | null): v
   override = fn;
 }
 
-export function readCredentialClock(): CredentialClock {
+/**
+ * Read the expiry without blocking.
+ *
+ * `security` is normally fast, but a locked Keychain can hold it for the whole
+ * timeout — and this runs on the sweeper. Synchronously, that stalls the event
+ * loop: during a halt the gateway would stop answering and the dashboard would
+ * freeze for five seconds every fifteen.
+ */
+export async function readCredentialClock(): Promise<CredentialClock> {
   if (override) return override();
 
   // An explicit key never expires on its own, so there is nothing to watch.
@@ -61,12 +72,11 @@ export function readCredentialClock(): CredentialClock {
   try {
     // `security` prints the secret on stdout; it is parsed for one number and
     // the string is never retained.
-    const raw = execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
+    const { stdout } = await exec('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
       encoding: 'utf8',
       timeout: 5000,
-      stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return parse(raw.trim(), 'keychain');
+    return parse(stdout.trim(), 'keychain');
   } catch {
     return { source: 'none' };
   }

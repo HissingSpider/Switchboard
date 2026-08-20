@@ -121,12 +121,20 @@ public/        dashboard              skills/        starter skills
 - A fix is verified by re-running the originating check *here*, not by believing
   the run's own summary. `investigations.verifyFix` is what makes "fixed" mean
   something.
+- A warm turn needs a ceiling. `WarmSession` resolves on `result` or `exit`, so
+  a process that stays alive and says nothing never settles — and an unbounded
+  wait strands the run in `queued`, where `sweep()` cannot cap it and `kill()`
+  cannot reach it, while leaving the session marked busy. One wedge would
+  otherwise turn warm chat off until the next restart, silently.
 - A halting failure — no auth, no credit — is true for every queued run, not
   just the one that hit it. `registry.haltGate` refuses new work while it
   stands, because a daemon that knows it is broken must not keep spending slots
   proving it. Expired auth lifts its own halt by watching the stored
   credential's expiry move forward; exhausted credit has no local evidence, so
-  it stays a human's decision rather than a guess dressed up as recovery.
+  it stays a human's decision rather than a guess dressed up as recovery. A
+  present `ANTHROPIC_API_KEY` is *not* evidence of recovery — `process.env` is
+  fixed for the life of the daemon, so a revoked key would clear its own halt on
+  every sweep and re-fail, which is the waste the halt exists to stop.
 - "A credential exists" is not "a credential works". Doctor's auth check stayed
   green through three failed scheduled runs. The access token renews itself; the
   *refresh* token expiring is what needs a person, so that is what is checked.

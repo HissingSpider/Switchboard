@@ -111,7 +111,7 @@ export async function runDoctor(cfg: LoadedConfig): Promise<Check[]> {
       // difference is not academic: three scheduled runs died on an expired
       // login while this check stayed green. The refresh token is the one that
       // needs a human — the access token renews itself.
-      const clock = readCredentialClock();
+      const clock = await readCredentialClock();
       const refreshDead = clock.refreshExpiresAt !== undefined && clock.refreshExpiresAt < Date.now();
       if (refreshDead) {
         add({

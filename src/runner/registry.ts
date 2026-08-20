@@ -102,7 +102,7 @@ export class RunRegistry extends EventEmitter {
    */
   haltGate: (() => { message: string; remedy: string } | null) | null = null;
   /** Asked on the sweeper to see whether a halt has fixed itself. */
-  haltRecheck: (() => boolean) | null = null;
+  haltRecheck: (() => Promise<boolean>) | null = null;
 
   start(): void {
     this.sweeper = setInterval(() => this.sweep(), 15_000);
@@ -607,8 +607,9 @@ export class RunRegistry extends EventEmitter {
   /** Cost, wall-clock and idleness caps, checked out-of-band from the stream. */
   private sweep(): void {
     // Cheap and local: reads a stored expiry, spends nothing, and un-halts the
-    // daemon the moment someone logs back in.
-    if (this.haltGate?.()) this.haltRecheck?.();
+    // daemon the moment someone logs back in. Not awaited — the sweeper has
+    // caps to enforce and must not wait on a Keychain read to do it.
+    if (this.haltGate?.()) void this.haltRecheck?.();
 
     for (const run of [...this.active.values()]) {
       const id = run.record.id;

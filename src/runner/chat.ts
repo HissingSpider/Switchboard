@@ -15,6 +15,16 @@ const log = logger('chat');
 export const ESCALATE = 'NEEDS_TOOLS';
 
 /**
+ * How long a conversational turn may take before the session is written off.
+ *
+ * Generous next to the 2s a warm reply actually takes, because the cost of
+ * being wrong is only a cold spawn — and mean next to the cold path's own caps,
+ * because a chat turn that has taken half a minute has already lost the race it
+ * existed to win.
+ */
+const TURN_TIMEOUT_MS = 45_000;
+
+/**
  * Questions that are about this machine rather than about the world.
  *
  * The sentinel alone is not enough, and the failure is quiet rather than loud:
@@ -39,8 +49,11 @@ const NEEDS_TOOLS = [
   /\b(how many|how much) .*\b(lines?|files?|commits?|runs?|tests?|errors?)\b/i,
   // Anything that has to leave the machine to be true.
   /\b(look up|google|browse|fetch|download|current|latest|today'?s|right now)\b/i,
-  // Running something.
-  /\b(run|execute|npm |git |node |build|deploy|test)\b/i,
+  // Running something *here*. The verb alone is not enough: "how do I run a
+  // marathon" is conversation, and sending it down the query lane costs a cold
+  // spawn on the expensive model to answer a question about running.
+  /\b(npm|npx|pnpm|yarn|git|node|cargo|make|docker|launchctl|brew)\b/i,
+  /\b(run|execute|build|deploy|compile|install|restart)\b.*\b(it|this|that|the (test|tests|build|suite|script|command|daemon|server)|npm|script|command|tests?|suite|build)\b/i,
 ];
 
 /**
@@ -100,6 +113,12 @@ export class ChatResponder {
    * changed anyway.
    */
   private boundThread: string | null = null;
+
+  /**
+   * How long one turn may take. Settable so a test can prove the timeout
+   * without waiting out the real one.
+   */
+  turnTimeoutMs = TURN_TIMEOUT_MS;
 
   constructor(private readonly cfg: LoadedConfig) {}
 
@@ -164,7 +183,26 @@ export class ChatResponder {
         this.boundThread = threadId;
       }
 
-      const res = await warm.ask(prompt).done;
+      // A turn with no ceiling is a turn that can wedge forever: WarmSession
+      // resolves on `result` or `exit`, so a process that stays alive and says
+      // nothing never settles. Left unbounded it strands the run in `queued`,
+      // where sweep() cannot cap it and kill() cannot reach it, and leaves the
+      // session marked busy — quietly turning warm chat off until a restart.
+      const turn = warm.ask(prompt);
+      const res = await Promise.race([
+        turn.done,
+        new Promise<null>((r) => setTimeout(() => r(null), this.turnTimeoutMs)),
+      ]);
+      if (!res) {
+        // Abandon frees the session for the next turn; the process is recycled
+        // because one that missed a whole turn has stopped being trustworthy.
+        turn.abandon();
+        log.warn('warm chat turn timed out — recycling the session', { threadId });
+        this.warm?.stop();
+        this.warm = null;
+        this.boundThread = null;
+        return { kind: 'unavailable' };
+      }
       const text = res.text.trim();
       if (text.toUpperCase().includes(ESCALATE)) return { kind: 'escalate' };
       // An empty answer is a broken session, not a considered refusal.
