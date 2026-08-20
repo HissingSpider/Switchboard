@@ -32,6 +32,20 @@ const CHAT_DB = join(homedir(), 'Library', 'Messages', 'chat.db');
 /** How long a sent message stays recognisable as our own echo. */
 const ECHO_TTL_MS = 120_000;
 
+/**
+ * How out of date a message may be and still be treated as a request.
+ *
+ * Starting from `MAX(ROWID)` stops a fresh install replaying history, but it
+ * cannot stop Apple *delivering* history: a message composed days ago arrives
+ * with a brand-new ROWID when another device finally syncs. Five did on one
+ * evening here, in the same second, all of them notifications this daemon had
+ * sent days earlier — each one answered as if someone had just asked.
+ *
+ * Nobody is waiting on a two-hour-old text. Acting on one cannot help and can
+ * spend real money, so the message date is checked as well as its position.
+ */
+const STALE_MESSAGE_MS = 30 * 60_000;
+
 /** Apple's epoch is 2001-01-01; modern macOS stores nanoseconds since then. */
 const APPLE_EPOCH_MS = Date.UTC(2001, 0, 1);
 
@@ -315,6 +329,19 @@ export class NativeImessageAdapter implements ChannelAdapter {
     const threadId = row.chat_guid ?? sender;
     if (text && this.isOwnEcho(threadId, text)) {
       log.debug('ignored our own message echoed back', { threadId, text: text.slice(0, 60) });
+      return undefined;
+    }
+
+    // A late sync, not a request. The echo check cannot catch these: it holds
+    // two minutes of text in memory, and these arrive days after they were
+    // written, long after the daemon that said them has restarted.
+    const sentAt = appleDateToMs(row.date);
+    if (sentAt && Date.now() - sentAt > STALE_MESSAGE_MS) {
+      log.info('ignored a stale message delivered late', {
+        threadId,
+        ageMin: Math.round((Date.now() - sentAt) / 60_000),
+        text: text.slice(0, 60),
+      });
       return undefined;
     }
 

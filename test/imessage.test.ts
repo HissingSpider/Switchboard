@@ -26,7 +26,21 @@ function fakeChatDb(): { path: string; insert: (m: { text?: string | null; body?
     CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
   `);
 
-  const insert = (m: { text?: string | null; body?: Buffer | null; sender: string; chat: string; fromMe?: boolean }): number => {
+  /**
+   * `sentAt` defaults to now, because that is what an arriving message is. The
+   * adapter ignores anything much older, so a fixed date in the past would make
+   * every message in every test look like a late sync.
+   */
+  const appleNs = (ms: number): number => Math.round(((ms - Date.UTC(2001, 0, 1)) / 1000) * 1e9);
+
+  const insert = (m: {
+    text?: string | null;
+    body?: Buffer | null;
+    sender: string;
+    chat: string;
+    fromMe?: boolean;
+    sentAt?: number;
+  }): number => {
     let handleId = (db.prepare('SELECT ROWID FROM handle WHERE id = ?').get(m.sender) as { ROWID?: number } | undefined)?.ROWID;
     if (!handleId) handleId = Number(db.prepare('INSERT INTO handle (id) VALUES (?)').run(m.sender).lastInsertRowid);
     let chatId = (db.prepare('SELECT ROWID FROM chat WHERE guid = ?').get(m.chat) as { ROWID?: number } | undefined)?.ROWID;
@@ -35,7 +49,8 @@ function fakeChatDb(): { path: string; insert: (m: { text?: string | null; body?
     const rowid = Number(
       db
         .prepare('INSERT INTO message (guid, text, attributedBody, date, is_from_me, handle_id) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(`g-${Math.random()}`, m.text ?? null, m.body ?? null, 750000000000000000, m.fromMe ? 1 : 0, handleId).lastInsertRowid,
+        .run(`g-${Math.random()}`, m.text ?? null, m.body ?? null, appleNs(m.sentAt ?? Date.now()), m.fromMe ? 1 : 0, handleId)
+        .lastInsertRowid,
     );
     db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(chatId, rowid);
     return rowid;
@@ -288,5 +303,45 @@ describe('echo suppression', () => {
     await adapter.poll();
     assert.deepEqual(seen, ['iMessage;-;+15550100001:ping']);
     await adapter.stop();
+  });
+});
+
+describe('a late sync is not a request', () => {
+  /**
+   * Observed: five messages arrived in the same second, every one of them a
+   * notification this daemon had sent days earlier, each answered as if it had
+   * just been asked. Starting from MAX(ROWID) stops a fresh install replaying
+   * history; it cannot stop Apple delivering history with new ROWIDs when
+   * another device syncs.
+   */
+  test('a message written hours ago is ignored, however new its ROWID', async () => {
+    const db = fakeChatDb();
+    const adapter = adapterFor(db.path, ['+15550107777']);
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+
+    db.insert({
+      text: 'r-3s5t3 produced nothing for 303s — killing',
+      sender: '+15550107777',
+      chat: 'iMessage;-;+15550107777',
+      sentAt: Date.now() - 2 * 24 * 60 * 60_000,
+    });
+    await adapter.poll();
+    assert.deepEqual(seen, [], 'nobody is waiting on a two-day-old text');
+  });
+
+  test('a message from a few minutes ago still counts', async () => {
+    // The guard must not swallow a real one: a phone on a slow connection, or a
+    // daemon that was briefly down, is normal.
+    const db = fakeChatDb();
+    const adapter = adapterFor(db.path, ['+15550107777']);
+    const seen: string[] = [];
+    adapter.onMessage = (m) => void seen.push(m.text);
+    await adapter.start();
+
+    db.insert({ text: 'status', sender: '+15550107777', chat: 'iMessage;-;+15550107777', sentAt: Date.now() - 5 * 60_000 });
+    await adapter.poll();
+    assert.deepEqual(seen, ['status']);
   });
 });

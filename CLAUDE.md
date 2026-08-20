@@ -121,6 +121,12 @@ public/        dashboard              skills/        starter skills
 - A fix is verified by re-running the originating check *here*, not by believing
   the run's own summary. `investigations.verifyFix` is what makes "fixed" mean
   something.
+- Starting the iMessage reader at `MAX(ROWID)` stops a fresh install replaying
+  history; it does not stop Apple *delivering* history. A message composed days
+  ago arrives with a brand-new ROWID when another device finally syncs, and the
+  echo check cannot catch it — that holds two minutes of text in memory, and by
+  then the daemon that said it has restarted. The message's own date is the
+  second check, and it is the one that works.
 - Recall (`src/store/recall.ts`) is a *read* of the event log and must stay one.
   No index, no embeddings, no second table that can disagree with the first —
   anything it cannot answer from the log it does not answer.
