@@ -14,7 +14,7 @@
  * would show a finished run as still going, or hide one that needs approval.
  */
 
-const SHELL_CACHE = 'swb-shell-v4';
+const SHELL_CACHE = 'swb-shell-v5';
 const SHELL = ['/', '/app.css', '/app.js', '/icon-192.png', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
