@@ -14,6 +14,13 @@ export type ActionTier = 'allow' | 'confirm' | 'deny';
 export interface ProjectConfig {
   /** Shortcut name the human types: "swb", "dd", "site". */
   name: string;
+  /**
+   * What the project is *called*. The shortcut is for typing and texting; it is
+   * never what anything reads back to you. Unset, the dashboard falls back to
+   * the directory name un-camel-cased, which is right often enough that this
+   * only has to be set where it isn't.
+   */
+  label?: string;
   /** Absolute path to the working directory. */
   path: string;
   /** Optional aliases the intent router will also match. */
@@ -26,6 +33,23 @@ export interface ProjectConfig {
   deerdawnProjectId?: string;
   /** Skip git branch-per-run for scratch dirs. */
   git?: boolean;
+}
+
+/**
+ * What a project is called, for anything a person reads. The shortcut is what
+ * you type; it is never what gets read back to you. Unset, the directory name
+ * un-camel-cased is right often enough that `label` only has to be set where
+ * it isn't.
+ */
+export function projectLabel(project: Pick<ProjectConfig, 'name' | 'label' | 'path'>): string {
+  if (project.label) return project.label;
+  const base = project.path.replace(/\/+$/, '').split('/').pop();
+  if (!base) return project.name;
+  return base
+    .replace(/[-_]+/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .trim()
+    .replace(/\b[a-z]/g, (c) => c.toUpperCase());
 }
 
 export interface PermissionProfile {

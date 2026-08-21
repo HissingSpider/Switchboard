@@ -1,8 +1,26 @@
-// Switchboard dashboard. One SSE stream feeds everything; the REST API is only
-// used for things that aren't in the event log (history, cost, config).
+// Switchboard console. One SSE stream feeds everything; the REST API is only
+// used for what isn't in the event log (history, cost, config, devices).
+//
+// The shape of the UI: a project rail on the left, the runs for whichever
+// project is selected, the transcript of one run, and that run's detail. On a
+// phone the middle two are one screen at a time and the rail becomes a tab bar.
 
 const $ = (sel) => document.querySelector(sel);
-const state = { runs: [], selected: null, events: [], projects: [], agents: [], pending: [], verbose: false };
+const $$ = (sel) => [...document.querySelectorAll(sel)];
+
+const state = {
+  runs: [],
+  selected: null,
+  selectedRun: null,
+  events: [],
+  projects: [],
+  agents: [],
+  pending: [],
+  verbose: false,
+  /** null = every project. '' is a real value: the scratch directory. */
+  project: null,
+  view: 'live',
+};
 
 /** A paired device holds its own token; on the Mac Mini itself there is none
  *  and loopback is trusted. */
@@ -19,7 +37,7 @@ const api = async (path, init = {}) => {
     },
   });
   if (res.status === 401) {
-    // The token was revoked from the Setup tab; send this device back to pairing.
+    // The token was revoked from Settings; send this device back to pairing.
     localStorage.removeItem('swb-token');
     location.replace('/pair.html');
   }
@@ -27,62 +45,166 @@ const api = async (path, init = {}) => {
   return res.json();
 };
 
-const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
-const time = (iso) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const shortPath = (t) => String(t ?? '').replace(/^\/Users\/[^/]+\//, '~/');
+const money = (n) => `$${Number(n ?? 0).toFixed(Number(n) >= 10 ? 2 : 3)}`;
 
-// ------------------------------------------------------------------ tabs
-for (const btn of document.querySelectorAll('nav button')) {
-  btn.onclick = () => {
-    for (const b of document.querySelectorAll('nav button')) b.classList.toggle('active', b === btn);
-    for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t.id === `tab-${btn.dataset.tab}`);
-    // Leaving Live and coming back should land on the list, not on whichever
-    // run happened to be open before.
-    if (btn.dataset.tab !== 'live') setView('list');
-    if (btn.dataset.tab === 'history') loadHistory();
-    if (btn.dataset.tab === 'board') loadBoard();
-    if (btn.dataset.tab === 'cost') loadCost();
-    if (btn.dataset.tab === 'inbox') loadInbox();
-    if (btn.dataset.tab === 'skills') loadSkills();
-    if (btn.dataset.tab === 'setup') loadSetup();
+function ago(iso) {
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86_400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86_400)}d ago`;
+}
+
+const clock = (iso) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function debounce(fn, ms) {
+  let t;
+  return (...a) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...a), ms);
   };
 }
 
-// ----------------------------------------------------------------- status
+/**
+ * A project is named in full. The short key (`swb`) is what you type and text;
+ * it is never what you read. `label` in config wins; failing that the directory
+ * name, un-camel-cased, which turns BlueHorseshoe into Blue Horseshoe.
+ */
+function projectLabel(p) {
+  if (p.label) return p.label;
+  const base = String(p.path ?? '').replace(/\/+$/, '').split('/').pop() ?? p.name;
+  const words = base.replace(/[-_]+/g, ' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').trim();
+  return words.replace(/\b[a-z]/g, (c) => c.toUpperCase());
+}
+
+const labelFor = (name) => {
+  if (name === null || name === undefined) return 'All projects';
+  // '(none)' is what the spend query calls a run with no project.
+  if (name === '' || name === '(none)') return 'No project';
+  const p = state.projects.find((x) => x.name === name);
+  return p ? projectLabel(p) : name;
+};
+
+// ------------------------------------------------------------------- views
+
+function showView(name) {
+  state.view = name;
+  for (const b of $$('.railrow[data-view], .tabbtn[data-view]')) b.classList.toggle('active', b.dataset.view === name);
+  for (const v of $$('.view')) v.classList.toggle('active', v.id === `view-${name}`);
+  // Coming back to Live should land on the list, not on whichever run happened
+  // to be open when you left.
+  if (name !== 'live') setView('list');
+  const load = { history: loadHistory, tasks: loadBoard, cost: loadCost, inbox: loadInbox, skills: loadSkills, setup: loadSetup }[name];
+  load?.();
+}
+
+for (const b of $$('.railrow[data-view], .tabbtn[data-view]')) b.onclick = () => showView(b.dataset.view);
+
+/**
+ * On a phone the run list and the run itself are two screens rather than two
+ * columns; on a wide screen `data-view` is set but nothing reads it. Pushing a
+ * history entry means the phone's back gesture returns to the list instead of
+ * leaving the app, which is what anyone expects from a Home Screen icon.
+ */
+const isPhone = () => window.matchMedia('(max-width: 980px)').matches;
+
+function setView(view, { push = false } = {}) {
+  document.body.dataset.view = view;
+  if (push && isPhone()) history.pushState({ view }, '');
+}
+setView('list');
+window.addEventListener('popstate', () => setView('list'));
+
+// ---------------------------------------------------------------- projects
+
+function renderProjects() {
+  const counts = new Map();
+  for (const r of state.runs) {
+    if (r.status !== 'running' && r.status !== 'queued') continue;
+    const k = r.project ?? '';
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const row = (key, label, sub, extra = '') => {
+    const n = key === null ? [...counts.values()].reduce((a, b) => a + b, 0) : (counts.get(key) ?? 0);
+    return `<button class="railrow projrow ${extra} ${state.project === key ? 'active' : ''}" data-project="${key === null ? '' : esc(key)}" data-all="${key === null}">
+      <span class="dot"></span>
+      <span class="grow">
+        <span class="label">${esc(label)}</span>
+        ${sub ? `<span class="path">${esc(sub)}</span>` : ''}
+      </span>
+      ${n ? `<span class="count">${n}</span>` : ''}
+    </button>`;
+  };
+
+  $('#projects').innerHTML = [
+    row(null, 'All projects', ''),
+    ...state.projects.map((p) => row(p.name, projectLabel(p), shortPath(p.path), p.exists === false ? 'missing' : '')),
+    row('', 'No project', 'Scratch directory, no git'),
+  ].join('');
+
+  for (const b of $('#projects').querySelectorAll('[data-project]')) {
+    b.onclick = () => selectProject(b.dataset.all === 'true' ? null : b.dataset.project);
+  }
+}
+
+function selectProject(key) {
+  state.project = key;
+  $('#runs-title').textContent = labelFor(key);
+  // The composer follows the rail: picking a project is how you say where the
+  // next thing should run.
+  if (key !== null) $('#project').value = key;
+  $('#runs-project').value = key === null ? '*' : key;
+  renderProjects();
+  showView('live');
+  refreshRuns();
+}
+
+// ------------------------------------------------------------------ status
+
 async function refreshStatus() {
   const s = await api('/api/status');
-  const box = $('#summary');
-  // A halt is the only thing worth reading when there is one: "0 running" is
-  // true and useless if nothing *can* run.
+  const health = $('#health');
   if (s.halted) {
-    box.textContent = `⚠ ${s.halted.message} ${s.halted.remedy}`;
-    box.classList.add('halted');
+    // A halt is the only thing worth reading when there is one: "0 running" is
+    // true and useless if nothing *can* run.
+    health.className = 'healthline halted';
+    health.innerHTML = `<span class="dot"></span><span>${esc(s.halted.message)} ${esc(s.halted.remedy)}</span>`;
   } else {
-    const pct = Math.min(100, (s.monthSpendUsd / Math.max(1, s.monthBudgetUsd)) * 100);
-    box.classList.remove('halted');
-    box.innerHTML = [
-      `<span class="chip ${s.active ? 'live' : ''}"><span class="dot"></span><b>${s.active}</b>/${s.capacity} running</span>`,
-      s.queued ? `<span class="chip"><b>${s.queued}</b> queued</span>` : '',
-      `<span class="chip"><span class="meter ${pct >= 100 ? 'over' : pct >= 80 ? 'hot' : ''}"><i style="width:${pct}%"></i></span><b>$${s.monthSpendUsd.toFixed(2)}</b> of $${s.monthBudgetUsd}</span>`,
-      `<span class="chip"><b>${s.skills}</b> skills</span>`,
-    ].join('');
+    health.className = 'healthline';
+    health.innerHTML = `<span class="dot"></span><span>Daemon healthy · ${s.active} of ${s.capacity} slots busy${s.queued ? ` · ${s.queued} queued` : ''} · ${s.skills} skills</span>`;
   }
+
+  const pct = Math.min(100, (s.monthSpendUsd / Math.max(1, s.monthBudgetUsd)) * 100);
+  $('#spend').textContent = `$${s.monthSpendUsd.toFixed(2)}`;
+  $('#budget').textContent = `/ $${s.monthBudgetUsd}`;
+  const meter = $('#budget-meter');
+  meter.className = `meter ${pct >= 100 ? 'over' : pct >= 80 ? 'hot' : ''}`;
+  meter.firstElementChild.style.width = `${pct}%`;
+
   await refreshConfirmations();
 }
+
+// ----------------------------------------------------------- confirmations
 
 async function refreshConfirmations() {
   const { pending } = await api('/api/confirmations');
   const before = state.pending.map((c) => c.id).join();
   state.pending = pending;
-  const badge = $('#inbox-badge');
-  badge.hidden = pending.length === 0;
-  badge.textContent = String(pending.length);
+  for (const id of ['#inbox-badge', '#tab-badge']) {
+    const badge = $(id);
+    badge.hidden = pending.length === 0;
+    badge.textContent = String(pending.length);
+  }
   // The transcript renders a pending confirmation as buttons and an answered
   // one as a line of text, so it has to be redrawn when that flips.
   if (before !== pending.map((c) => c.id).join()) {
     renderEvents();
     paintRunlistFlags();
+    renderDetail();
   }
-  if ($('#tab-inbox').classList.contains('active')) loadInbox();
+  if (state.view === 'inbox') loadInbox();
 }
 
 const pendingById = (id) => state.pending.find((c) => c.id === id);
@@ -96,8 +218,8 @@ async function answer(id, approve, always = false) {
   for (const b of document.querySelectorAll(`[data-cid="${id}"]`)) b.disabled = true;
   await api(`/api/confirmations/${id}`, { method: 'POST', body: JSON.stringify({ approve, always }) });
   await refreshConfirmations();
-  if ($('#tab-inbox').classList.contains('active')) await loadInbox();
-  if ($('#tab-setup').classList.contains('active')) await loadRules();
+  if (state.view === 'inbox') await loadInbox();
+  if (state.view === 'setup') await loadRules();
 }
 
 /** Buttons live inside innerHTML that is rebuilt constantly, so they are wired
@@ -116,21 +238,22 @@ wireApprovals($('#inbox'));
 /** One approval, rendered the same way in the transcript and in the inbox. */
 function approvalCard(c, { showRun = true } = {}) {
   const always = c.alwaysSpec
-    ? `<button class="btn" data-cid="${c.id}" data-act="always" title="Remember this answer as a rule">Always allow <span class="always-spec">${esc(c.alwaysSpec)}</span></button>`
+    ? `<button class="btn" data-cid="${esc(c.id)}" data-act="always" title="Remember this answer as a rule">Always allow <span class="always-spec">${esc(c.alwaysSpec)}</span></button>`
     : '';
   return `<div class="approval">
     <div class="what">
-      ${showRun ? `<span class="who">${esc(c.runId)}</span>` : ''}
-      <span class="verb">wants to run</span>
+      <span class="verb">Needs your approval</span>
       <span class="tool">${esc(c.tool)}</span>
+      <span class="grow"></span>
+      ${showRun ? `<span class="who">${esc(c.runId)}</span>` : ''}
     </div>
     <div class="detail">${esc(c.detail)}</div>
     <div class="actions">
-      <button class="btn btn-ok" data-cid="${c.id}" data-act="approve">Approve once</button>
+      <button class="btn btn-ok" data-cid="${esc(c.id)}" data-act="approve">Approve once</button>
       ${always}
-      <button class="btn btn-danger" data-cid="${c.id}" data-act="deny">Deny</button>
+      <button class="btn btn-danger" data-cid="${esc(c.id)}" data-act="deny">Deny</button>
       <span class="sub">${esc(c.id)} · asked ${ago(c.createdAt)}</span>
-      ${c.alwaysSpec ? `<div class="always-why">Remembers <code>${esc(c.alwaysSpec)}</code> as a standing rule, revocable under Setup. Anything that pushes, publishes, sends, buys or deletes is never offered here.</div>` : ''}
+      ${c.alwaysSpec ? `<div class="always-why">Remembers <code>${esc(c.alwaysSpec)}</code> as a standing rule, revocable under Settings. Anything that pushes, publishes, sends, buys or deletes is never offered here.</div>` : ''}
     </div>
   </div>`;
 }
@@ -143,79 +266,80 @@ function paintRunlistFlags() {
   }
 }
 
-// ------------------------------------------------------------------- runs
+// -------------------------------------------------------------------- runs
+
 async function refreshRuns() {
-  const { runs } = await api('/api/runs?limit=40');
+  const params = new URLSearchParams({ limit: '40' });
+  if (state.project !== null) params.set('project', state.project);
+  const { runs } = await api(`/api/runs?${params}`);
   state.runs = runs;
   $('#runcount').textContent = runs.length ? `${runs.length} recent` : '';
+  $('#nav-runs').textContent = runs.length ? String(runs.length) : '';
+
+  const waiting = new Set(state.pending.map((c) => c.runId));
   $('#runlist').innerHTML =
     runs
-      .map(
-        (r) => `<div class="runcard st-${r.status} ${r.id === state.selected ? 'sel' : ''}" data-id="${r.id}">
-        <div class="top">
-          <span class="id">${r.id}</span>
-          <span class="pill st-${r.status}">${r.status}</span>
-          <span class="cost">$${r.costUsd.toFixed(3)}</span>
-        </div>
-        <div class="sub">${esc(r.project ?? 'scratch')} · ${ago(r.createdAt)}</div>
-        <div class="prompt">${esc(r.prompt)}</div>
-      </div>`,
-      )
-      .join('') || '<div class="hint">No runs yet.</div>';
+      .map((r) => {
+        const status = waiting.has(r.id) ? 'waiting' : r.status;
+        const label = waiting.has(r.id) ? 'waiting on you' : r.status;
+        return `<div class="runcard ${r.id === state.selected ? 'sel' : ''}" data-id="${esc(r.id)}">
+          <div class="top">
+            <span class="pill st-${esc(status)}">${esc(label)}</span>
+            <span class="grow"></span>
+            <span class="id">${esc(r.id)}</span>
+          </div>
+          <div class="prompt">${esc(r.prompt)}</div>
+          <div class="top">
+            <span class="sub">${esc(labelFor(r.project ?? ''))} · ${ago(r.createdAt)}</span>
+            <span class="grow"></span>
+            <span class="cost">${money(r.costUsd)}</span>
+          </div>
+        </div>`;
+      })
+      .join('') || '<p class="hint">Nothing here yet. Say something below to start.</p>';
+
   for (const card of document.querySelectorAll('.runcard')) card.onclick = () => selectRun(card.dataset.id, { user: true });
   paintRunlistFlags();
+  renderProjects();
   if (!state.selected && runs[0]) selectRun(runs[0].id);
 }
 
-/**
- * On a phone the run list and the run itself are two screens rather than two
- * columns; on a wide screen `data-view` is set but nothing reads it. Pushing a
- * history entry means the phone's back gesture returns to the list instead of
- * leaving the app, which is what anyone actually expects from a Home Screen icon.
- */
-const isPhone = () => window.matchMedia('(max-width: 640px)').matches;
-
-function setView(view, { push = false } = {}) {
-  document.body.dataset.view = view;
-  if (push && isPhone()) history.pushState({ view }, '');
-  if (view === 'list') window.scrollTo(0, 0);
+function clearSelection() {
+  state.selected = null;
+  state.selectedRun = null;
+  state.events = [];
+  $('#runhead').innerHTML = `<div class="titles"><div class="title">New thread</div><div class="sub">${esc(labelFor(state.project))}</div></div>`;
+  $('#events').innerHTML = '<p class="hint">Nothing running. Whatever you send starts a new run.</p>';
+  renderComposer();
+  renderDetail();
+  for (const c of document.querySelectorAll('.runcard.sel')) c.classList.remove('sel');
 }
-setView('list');
-
-window.addEventListener('popstate', () => setView('list'));
 
 async function selectRun(id, opts = {}) {
   state.selected = id;
   if (opts.user) setView('detail', { push: true });
+
   const { run, artifacts, children } = await api(`/api/runs/${id}`);
   const { events } = await api(`/api/runs/${id}/events`);
+  state.selectedRun = { ...run, artifacts: artifacts ?? [], children: children ?? [] };
   state.events = events;
 
-  const hasDiff = artifacts.some((a) => a.name === 'changes.diff');
-  const fact = (t) => `<span class="fact">${esc(t)}</span>`;
+  const hasDiff = (artifacts ?? []).some((a) => a.name === 'changes.diff');
+  const live = run.status === 'running' || run.status === 'queued';
+
   $('#runhead').innerHTML =
-    `<button class="backbtn btn btn-ghost" id="backbtn">‹ Runs</button>` +
-    `<span class="runid">${run.id}</span>` +
-    `<span class="pill st-${run.status}">${run.status}</span>` +
-    `<span class="facts">` +
-    [
-      run.project ?? 'scratch',
-      run.agent ?? 'default agent',
-      run.taskClass,
-      run.model ?? 'default model',
-      `${run.turns} turns`,
-      `$${run.costUsd.toFixed(3)}`,
-      run.branch ? run.branch : '',
-      children?.length ? `${children.length} child run(s)` : '',
-    ]
-      .filter(Boolean)
-      .map(fact)
-      .join('') +
-    `</span>` +
-    `<span class="tools">` +
-    (hasDiff ? `<button id="showdiff" class="btn btn-sm">Diff</button>` : '') +
-    `<button id="verbose" class="btn btn-sm btn-ghost">${state.verbose ? 'Hide detail' : 'Show detail'}</button>` +
-    `</span>`;
+    `<button class="btn btn-ghost btn-sm backbtn" id="backbtn">‹ Runs</button>
+     <div class="titles">
+       <div class="title">${esc(run.prompt)}</div>
+       <div class="sub">${esc(labelFor(run.project ?? ''))} · ${esc(run.id)} · ${clock(run.createdAt)} · ${run.turns} turn${run.turns === 1 ? '' : 's'} · ${money(run.costUsd)}</div>
+     </div>
+     <span class="grow"></span>
+     <div class="tools">
+       ${hasDiff ? '<button class="btn btn-sm" id="showdiff">Diff</button>' : ''}
+       <button class="btn btn-sm btn-ghost" id="verbose">${state.verbose ? 'Hide detail' : 'Show detail'}</button>
+       ${live ? '<button class="btn btn-sm btn-danger" id="killbtn">Stop</button>' : '<button class="btn btn-sm" id="newthread2">New thread</button>'}
+     </div>`;
+
   $('#backbtn').onclick = () => (history.state?.view === 'detail' ? history.back() : setView('list'));
   if (hasDiff) $('#showdiff').onclick = () => showDiff(run.id);
   $('#verbose').onclick = () => {
@@ -223,11 +347,20 @@ async function selectRun(id, opts = {}) {
     $('#verbose').textContent = state.verbose ? 'Hide detail' : 'Show detail';
     renderEvents();
   };
+  if (live) $('#killbtn').onclick = () => api(`/api/runs/${run.id}`, { method: 'DELETE' });
+  else $('#newthread2').onclick = clearSelection;
 
-  $('#followup').hidden = !(run.status === 'running' || run.status === 'queued');
+  // A follow-up thread almost always belongs where the last one did, so the
+  // composer follows the run you are reading.
+  if (!live) $('#project').value = run.project ?? '';
+
   renderEvents();
+  renderComposer();
+  renderDetail();
   await refreshRuns();
 }
+
+// ------------------------------------------------------------- transcript
 
 /**
  * Minimal markdown, applied after escaping so it can never inject markup.
@@ -270,8 +403,6 @@ const NOISE = new Set(['usage.update', 'agent.thinking', 'tool.result', 'run.pro
 
 const TOOL_ICON = { Read: '□', Write: '✎', Edit: '✎', Bash: '›', Grep: '⌕', Glob: '⌕', WebFetch: '↗', WebSearch: '⌕', Task: '⌥' };
 
-const shortPath = (t) => String(t ?? '').replace(/^\/Users\/[^/]+\//, '~/');
-
 function renderEvents() {
   const box = $('#events');
   const stuck = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
@@ -279,7 +410,7 @@ function renderEvents() {
 
   let lastMinute = '';
   const rows = visible.map((e) => {
-    const minute = new Date(e.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const minute = clock(e.ts);
     const stamp = minute === lastMinute ? '' : `<div class="when">${minute}</div>`;
     lastMinute = minute;
     return stamp + renderEvent(e);
@@ -344,16 +475,84 @@ function renderEvent(e) {
   }
 }
 
-// ------------------------------------------------------------------- SSE
+// ------------------------------------------------------------ detail rail
+
+function renderDetail() {
+  const run = state.selectedRun;
+  $('#detail-id').textContent = run ? run.id : '';
+  if (!run) {
+    $('#detail').innerHTML = '<p class="empty">No run selected.</p>';
+    return;
+  }
+
+  const waiting = state.pending.some((c) => c.runId === run.id);
+  const fact = (k, v, mono = false) => `<div class="fact"><div class="k">${esc(k)}</div><div class="v ${mono ? 'mono' : ''}">${esc(v)}</div></div>`;
+
+  const others = state.runs.filter((r) => r.id !== run.id && (r.status === 'running' || r.status === 'queued'));
+  const hasDiff = run.artifacts.some((a) => a.name === 'changes.diff');
+
+  $('#detail').innerHTML = [
+    `<div class="facts">
+      ${fact('Status', waiting ? 'Waiting on you' : run.status)}
+      ${fact('Started', clock(run.createdAt))}
+      ${fact('Spent', money(run.costUsd), true)}
+      ${fact('Turns', String(run.turns), true)}
+    </div>`,
+
+    '<div class="hr"></div>',
+
+    `<div class="block">
+      <div class="section">Working in</div>
+      <div class="v">${esc(labelFor(run.project ?? ''))}</div>
+      ${run.branch ? `<div class="filerow"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="4.5" cy="4" r="1.8"/><circle cx="4.5" cy="12" r="1.8"/><circle cx="11.5" cy="8" r="1.8"/><path d="M4.5 5.8v4.4M6.2 4.6c3 0 3.6 1.4 3.6 2.6"/></svg><span class="name">${esc(run.branch)}</span></div>` : ''}
+      <div class="filerow"><span class="name">${esc(run.agent ?? 'default agent')} · ${esc(run.taskClass ?? '—')} · ${esc(run.model ?? 'default model')}</span></div>
+    </div>`,
+
+    run.artifacts.length
+      ? `<div class="hr"></div>
+         <div class="block">
+           <div class="section">Artifacts</div>
+           ${run.artifacts.map((a) => `<div class="filerow"><span class="name">${esc(a.name)}</span>${a.name === 'changes.diff' ? '<button class="btn btn-sm btn-ghost" data-diff="' + esc(run.id) + '">Open</button>' : ''}</div>`).join('')}
+           ${hasDiff ? '<div class="aside">Only files this run wrote itself are committed. Anything you changed while it worked stays in the working tree, uncommitted.</div>' : ''}
+         </div>`
+      : '',
+
+    run.children.length
+      ? `<div class="hr"></div>
+         <div class="block">
+           <div class="section">Child runs</div>
+           ${run.children.map((c) => `<div class="filerow"><span class="name">${esc(c.id ?? c)}</span></div>`).join('')}
+         </div>`
+      : '',
+
+    others.length
+      ? `<div class="hr"></div>
+         <div class="block">
+           <div class="section">Also running</div>
+           ${others
+             .map(
+               (r) => `<button class="railrow" data-goto="${esc(r.id)}" style="padding:10px 12px;border:1px solid var(--line)">
+                 <span class="dot" style="width:7px;height:7px;border-radius:50%;background:${r.status === 'running' ? 'var(--accent)' : 'var(--dim)'}"></span>
+                 <span class="grow"><span class="label">${esc(r.prompt.slice(0, 60))}</span><span class="path">${esc(labelFor(r.project ?? ''))} · ${esc(r.status)}</span></span>
+               </button>`,
+             )
+             .join('')}
+         </div>`
+      : '',
+  ].join('');
+
+  for (const b of $('#detail').querySelectorAll('[data-diff]')) b.onclick = () => showDiff(b.dataset.diff);
+  for (const b of $('#detail').querySelectorAll('[data-goto]')) b.onclick = () => selectRun(b.dataset.goto, { user: true });
+}
+
+// --------------------------------------------------------------------- SSE
 // EventSource reconnects on its own and resends Last-Event-ID, so the server
 // can replay exactly what was missed. We track the id anyway for the manual
 // reconnect path, because a phone that was asleep often gets a clean close
 // rather than an error.
 let lastEventId = 0;
 
-function setOffline(off) {
-  $('#offline').hidden = !off;
-}
+const setOffline = (off) => ($('#offline').hidden = !off);
 
 function connect() {
   const token = deviceToken();
@@ -396,41 +595,69 @@ document.addEventListener('visibilitychange', () => {
   refreshRuns().catch(() => undefined);
 });
 
-// ---------------------------------------------------------------- submit
-$('#submit').onsubmit = async (e) => {
+// ---------------------------------------------------------------- composer
+
+/** The composer is one box with two jobs: start a run, or talk to the one that
+ *  is still going. Which one it is has to be readable without clicking. */
+function renderComposer() {
+  const run = state.selectedRun;
+  const live = run && (run.status === 'running' || run.status === 'queued');
+  $('#replyto').hidden = !live;
+  if (live) $('#replyto-id').textContent = run.id;
+  $('#prompt').placeholder = live ? 'Say something to this run…  (⌘↵ to send)' : 'Ask a question, or give it a task…  (⌘↵ to send)';
+  $('#sendbtn').textContent = live ? 'Reply' : 'Send';
+  // Where a follow-up goes is decided; the selects would be lying.
+  for (const id of ['#project', '#class', '#agent']) $(id).disabled = Boolean(live);
+}
+
+$('#newthread').onclick = clearSelection;
+
+$('#composer').onsubmit = async (e) => {
   e.preventDefault();
-  const prompt = $('#prompt').value.trim();
-  if (!prompt) return;
-  const body = {
-    prompt,
-    project: $('#project').value || undefined,
-    agent: $('#agent').value || undefined,
-    taskClass: $('#class').value || undefined,
-    threadId: 'dashboard',
-  };
-  const { run } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
-  $('#prompt').value = '';
-  await refreshRuns();
-  selectRun(run.id, { user: true });
+  const text = $('#prompt').value.trim();
+  if (!text) return;
+  const run = state.selectedRun;
+  const live = run && (run.status === 'running' || run.status === 'queued');
+
+  $('#sendbtn').disabled = true;
+  try {
+    if (live) {
+      await api(`/api/runs/${run.id}/followup`, { method: 'POST', body: JSON.stringify({ text }) });
+      $('#prompt').value = '';
+    } else {
+      const body = {
+        prompt: text,
+        project: $('#project').value || undefined,
+        agent: $('#agent').value || undefined,
+        taskClass: $('#class').value || undefined,
+        threadId: 'dashboard',
+      };
+      const { run: created } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
+      $('#prompt').value = '';
+      await refreshRuns();
+      await selectRun(created.id, { user: true });
+    }
+  } finally {
+    $('#sendbtn').disabled = false;
+  }
 };
+
 $('#prompt').onkeydown = (e) => {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#submit').requestSubmit();
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#composer').requestSubmit();
+};
+// Grow with the text rather than scrolling a two-line box.
+$('#prompt').oninput = () => {
+  const el = $('#prompt');
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(190, el.scrollHeight)}px`;
 };
 
-$('#followup').onsubmit = async (e) => {
-  e.preventDefault();
-  const text = $('#followtext').value.trim();
-  if (!text || !state.selected) return;
-  await api(`/api/runs/${state.selected}/followup`, { method: 'POST', body: JSON.stringify({ text }) });
-  $('#followtext').value = '';
-};
-$('#killbtn').onclick = async () => {
-  if (state.selected) await api(`/api/runs/${state.selected}`, { method: 'DELETE' });
-};
+// -------------------------------------------------------------------- diff
 
-// ------------------------------------------------------------------ diff
 async function showDiff(id) {
-  const res = await fetch(`/api/runs/${id}/diff`);
+  const res = await fetch(`/api/runs/${id}/diff`, {
+    headers: deviceToken() ? { authorization: `Bearer ${deviceToken()}` } : {},
+  });
   const text = await res.text();
   $('#difftitle').textContent = `${id} — changes.diff`;
   $('#diff').innerHTML = text
@@ -444,7 +671,8 @@ async function showDiff(id) {
 }
 $('#diffclose').onclick = () => $('#diffbox').close();
 
-// --------------------------------------------------------------- history
+// ----------------------------------------------------------------- history
+
 async function loadHistory() {
   const params = new URLSearchParams({ limit: '200' });
   if ($('#search').value) params.set('q', $('#search').value);
@@ -455,13 +683,13 @@ async function loadHistory() {
     `<thead><tr><th>Run</th><th>When</th><th>Status</th><th>Project</th><th>Agent</th><th>Cost</th><th>Prompt</th></tr></thead><tbody>` +
     (runs
       .map(
-        (r) => `<tr data-id="${r.id}">
-          <td class="mono">${r.id}</td>
+        (r) => `<tr data-id="${esc(r.id)}">
+          <td class="mono">${esc(r.id)}</td>
           <td class="mono">${new Date(r.createdAt).toLocaleString()}</td>
-          <td><span class="pill st-${r.status}">${r.status}</span></td>
-          <td>${esc(r.project ?? '—')}</td>
+          <td><span class="pill st-${esc(r.status)}">${esc(r.status)}</span></td>
+          <td>${esc(labelFor(r.project ?? ''))}</td>
           <td>${esc(r.agent ?? '—')}</td>
-          <td class="mono">$${r.costUsd.toFixed(3)}</td>
+          <td class="mono">${money(r.costUsd)}</td>
           <td>${esc(r.prompt.slice(0, 90))}</td>
         </tr>`,
       )
@@ -469,7 +697,7 @@ async function loadHistory() {
     `</tbody>`;
   for (const tr of $('#history').querySelectorAll('tr[data-id]')) {
     tr.onclick = () => {
-      document.querySelector('nav button[data-tab="live"]').click();
+      showView('live');
       selectRun(tr.dataset.id, { user: true });
     };
   }
@@ -478,7 +706,8 @@ $('#search').oninput = debounce(loadHistory, 250);
 $('#filter-status').onchange = loadHistory;
 $('#filter-project').onchange = loadHistory;
 
-// ----------------------------------------------------------------- board
+// ------------------------------------------------------------------- board
+
 async function loadBoard() {
   const data = await api('/api/board');
   if (!data.board) {
@@ -488,26 +717,31 @@ async function loadBoard() {
   const columns = data.board.columns ?? data.board;
   $('#board').innerHTML = Object.entries(columns)
     .map(
-      ([name, cards]) => `<div class="col"><h3>${esc(name)} (${cards.length})</h3>${cards
-        .map((c) => `<div class="card">${esc(typeof c === 'string' ? c : c.title)}</div>`)
-        .join('')}</div>`,
+      ([name, cards]) => `<div class="col">
+        <h3>${esc(name)} <span class="dim mono">${cards.length}</span></h3>
+        ${cards.map((c) => `<div class="card">${esc(typeof c === 'string' ? c : c.title)}</div>`).join('') || '<p class="hint">Empty.</p>'}
+      </div>`,
     )
     .join('');
 }
 
-// ------------------------------------------------------------------ cost
+// -------------------------------------------------------------------- cost
+
 async function loadCost() {
   const c = await api('/api/cost');
   const pct = Math.min(100, (c.monthSpendUsd / c.monthBudgetUsd) * 100);
   $('#cost').innerHTML =
-    `<h2>$${c.monthSpendUsd.toFixed(2)} <span class="dim">of $${c.monthBudgetUsd} this month</span></h2>
-     <div class="bar ${pct >= 100 ? 'over' : ''}"><div style="width:${pct}%"></div></div>
+    `<div class="pagehead">
+       <h2>Spend</h2>
+       <div class="bignum"><b>$${c.monthSpendUsd.toFixed(2)}</b><span class="dim">of $${c.monthBudgetUsd} this month</span></div>
+     </div>
+     <div class="bar ${pct >= 100 ? 'over' : ''}" style="margin: 18px 0 26px"><div style="width:${pct}%"></div></div>
      <h3 class="section">By project</h3>
-     <div class="panel scrollx"><table><thead><tr><th>Project</th><th>Runs</th><th>Spend</th></tr></thead><tbody>` +
-    c.byProject.map((p) => `<tr><td>${esc(p.project)}</td><td class="mono">${p.runs}</td><td class="mono">$${Number(p.costUsd).toFixed(2)}</td></tr>`).join('') +
+     <div class="panel scrollx" style="margin: 10px 0 26px"><table><thead><tr><th>Project</th><th>Runs</th><th>Spend</th></tr></thead><tbody>` +
+    c.byProject.map((p) => `<tr><td>${esc(labelFor(p.project ?? ''))}</td><td class="mono">${p.runs}</td><td class="mono">$${Number(p.costUsd).toFixed(2)}</td></tr>`).join('') +
     `</tbody></table></div>
      <h3 class="section">By model</h3>
-     <p class="hint">Lanes pick the model: chat and read-only answers run cheap, real work runs on the default. If <code>(default)</code> owns the bill, something is routing everything to the top tier.</p>
+     <p class="hint" style="margin: 8px 0 10px">Lanes pick the model: chat and read-only answers run cheap, real work runs on the default. If <code>(default)</code> owns the bill, something is routing everything to the top tier.</p>
      <div class="panel scrollx"><table><thead><tr><th>Model</th><th>Runs</th><th>Spend</th><th>Avg</th></tr></thead><tbody>` +
     (c.byModel ?? [])
       .map(
@@ -517,51 +751,7 @@ async function loadCost() {
     `</tbody></table></div>`;
 }
 
-// ---------------------------------------------------------------- config
-async function loadConfig() {
-  const [projects, agents, skills, schedules] = await Promise.all([
-    api('/api/projects'),
-    api('/api/agents'),
-    api('/api/skills'),
-    api('/api/schedules'),
-  ]);
-  const section = (title, rows) => `<div class="col"><h3>${title}</h3>${rows.join('') || '<div class="card">none</div>'}</div>`;
-  $('#config').innerHTML =
-    `<div class="board">` +
-    section('Projects', projects.projects.map((p) => `<div class="card">${esc(p.name)} <span class="dim">${p.exists ? p.path : `MISSING ${p.path}`}</span></div>`)) +
-    section('Agents', agents.agents.map((a) => `<div class="card">${esc(a.name)} <span class="dim">${esc(a.description ?? a.taskClass ?? '')}</span></div>`)) +
-    section('Skills', skills.skills.map((s) => `<div class="card">${esc(s.name)} <span class="dim">${esc(s.description.slice(0, 80))}</span></div>`)) +
-    section('Schedules', schedules.jobs.map((j) => `<div class="card">${esc(j.name)} <span class="dim">${esc(j.spec)}${j.next ? ` → ${new Date(j.next).toLocaleString()}` : ''}</span></div>`)) +
-    `</div>`;
-}
-
-// ------------------------------------------------------------------ init
-function debounce(fn, ms) {
-  let t;
-  return (...a) => {
-    clearTimeout(t);
-    t = setTimeout(() => fn(...a), ms);
-  };
-}
-
-async function init() {
-  const [{ projects }, { agents }] = await Promise.all([api('/api/projects'), api('/api/agents')]);
-  state.projects = projects;
-  state.agents = agents;
-  for (const sel of ['#project', '#filter-project']) {
-    $(sel).innerHTML =
-      ($(sel).children[0]?.outerHTML ?? '') + projects.map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
-  }
-  $('#agent').innerHTML = `<option value="">default agent</option>` + agents.map((a) => `<option value="${esc(a.name)}">${esc(a.name)}</option>`).join('');
-  await refreshStatus();
-  await refreshRuns();
-  connect();
-  setInterval(refreshStatus, 15000);
-}
-
-init().catch((err) => ($('#summary').textContent = `error: ${err.message}`));
-
-// ----------------------------------------------------------------- inbox
+// ------------------------------------------------------------------- inbox
 
 async function loadInbox() {
   const { pending, audit } = await api('/api/confirmations');
@@ -573,7 +763,7 @@ async function loadInbox() {
     answered
       .map(
         (c) => `<div class="answered">
-        <span class="verdict st-${c.status}">${esc(c.status)}</span>
+        <span class="verdict st-${esc(c.status)}">${esc(c.status)}</span>
         <span class="tool">${esc(c.tool)}</span>
         <span class="detail">${esc(c.detail)}</span>
         <span class="dim who">${c.answeredBy ? esc(c.answeredBy) : 'no reply'} · ${ago(c.answeredAt ?? c.createdAt)}</span>
@@ -582,7 +772,7 @@ async function loadInbox() {
       .join('') || '<p class="hint">Nothing answered yet.</p>';
 }
 
-// -------------------------------------------------------- standing rules
+// --------------------------------------------------------- standing rules
 
 async function loadRules() {
   const { rules } = await api('/api/rules');
@@ -594,7 +784,7 @@ async function loadRules() {
               <div class="spec">${esc(r.spec)}${r.mode === 'exact' ? ' <span class="dim">(exact)</span>' : ''}</div>
               <div class="meta">${r.uses} use${r.uses === 1 ? '' : 's'}${r.lastUsedAt ? `, last ${ago(r.lastUsedAt)}` : ''} · granted ${ago(r.createdAt)} by ${esc(r.createdBy)}${r.sample ? ` · for: ${esc(r.sample.slice(0, 60))}` : ''}</div>
             </div>
-            <button class="btn btn-danger btn-sm" data-revoke-rule="${r.id}">Revoke</button>
+            <button class="btn btn-danger btn-sm" data-revoke-rule="${esc(r.id)}">Revoke</button>
           </div>`,
         )
         .join('')}</div>`
@@ -607,27 +797,17 @@ async function loadRules() {
   }
 }
 
-function ago(iso) {
-  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  return `${Math.round(s / 3600)}h ago`;
-}
-
-// ---------------------------------------------------------------- skills
+// ------------------------------------------------------------------ skills
 
 async function loadSkills() {
-  const [{ queue, stale }, all] = await Promise.all([api('/api/skills/review'), api('/api/skills')]);
-  const badge = $('#skills-badge');
+  const [{ queue }, all] = await Promise.all([api('/api/skills/review'), api('/api/skills')]);
   const needsMe = queue.filter((s) => s.flagged || s.proposal);
+  const badge = $('#skills-badge');
   badge.hidden = needsMe.length === 0;
   badge.textContent = String(needsMe.length);
 
-  $('#skills-review').innerHTML = queue.length
-    ? queue.map(skillCard).join('')
-    : '<p class="hint">Nothing needs review.</p>';
+  $('#skills-review').innerHTML = queue.length ? queue.map(skillCard).join('') : '<p class="hint">Nothing needs review.</p>';
 
-  const byName = new Map(all.skills.map((s) => [s.name, s]));
   $('#skills-all').innerHTML =
     all.skills
       .map((s) => {
@@ -638,12 +818,10 @@ async function loadSkills() {
         </div>`;
       })
       .join('') || '<p class="hint">No skills yet.</p>';
-  void byName;
-  void stale;
   wireSkillButtons();
 }
 
-const tierPill = (t) => `<span class="tier tier-${t}">${t}</span>`;
+const tierPill = (t) => `<span class="tier tier-${esc(t)}">${esc(t)}</span>`;
 
 function skillCard(s) {
   const rate = s.successRate === undefined ? 'never used' : `${Math.round(s.successRate * 100)}% over ${s.runs}`;
@@ -654,9 +832,9 @@ function skillCard(s) {
     ${s.flagReason ? `<div class="desc">flagged: ${esc(s.flagReason)}</div>` : ''}
     ${s.proposal ? `<div class="proposal">${esc(s.proposal)}</div>` : ''}
     <div class="row">
-      ${s.proposal ? `<button class="btn btn-primary" data-trust="${s.name}">Grant trusted</button>` : ''}
-      ${s.flagged ? `<button class="btn" data-unflag="${s.name}">Clear flag</button>` : ''}
-      ${s.retiredAt ? `<button class="btn" data-restore="${s.name}">Restore</button>` : `<button class="btn btn-danger" data-retire="${s.name}">Retire</button>`}
+      ${s.proposal ? `<button class="btn btn-primary" data-trust="${esc(s.name)}">Grant trusted</button>` : ''}
+      ${s.flagged ? `<button class="btn" data-unflag="${esc(s.name)}">Clear flag</button>` : ''}
+      ${s.retiredAt ? `<button class="btn" data-restore="${esc(s.name)}">Restore</button>` : `<button class="btn btn-danger" data-retire="${esc(s.name)}">Retire</button>`}
     </div>
   </div>`;
 }
@@ -672,7 +850,29 @@ function wireSkillButtons() {
   for (const b of document.querySelectorAll('[data-restore]')) b.onclick = () => act(b.dataset.restore, '/restore');
 }
 
-// ----------------------------------------------------------------- setup
+// ---------------------------------------------------------------- settings
+
+async function loadConfig() {
+  const [projects, agents, skills, schedules] = await Promise.all([
+    api('/api/projects'),
+    api('/api/agents'),
+    api('/api/skills'),
+    api('/api/schedules'),
+  ]);
+  const section = (title, rows) => `<div class="col"><h3>${title}</h3>${rows.join('') || '<div class="card">none</div>'}</div>`;
+  $('#config').innerHTML =
+    `<div class="board">` +
+    section(
+      'Projects',
+      projects.projects.map(
+        (p) => `<div class="card">${esc(projectLabel(p))}<span class="dim">${p.exists ? shortPath(p.path) : `MISSING ${shortPath(p.path)}`} · key: ${esc(p.name)}</span></div>`,
+      ),
+    ) +
+    section('Agents', agents.agents.map((a) => `<div class="card">${esc(a.name)}<span class="dim">${esc(a.description ?? a.taskClass ?? '')}</span></div>`)) +
+    section('Skills', skills.skills.map((s) => `<div class="card">${esc(s.name)}<span class="dim">${esc(s.description.slice(0, 80))}</span></div>`)) +
+    section('Schedules', schedules.jobs.map((j) => `<div class="card">${esc(j.name)}<span class="dim">${esc(j.spec)}${j.next ? ` → ${new Date(j.next).toLocaleString()}` : ''}</span></div>`)) +
+    `</div>`;
+}
 
 async function loadSetup() {
   await loadConfig();
@@ -694,11 +894,11 @@ async function refreshDevices() {
     devices
       .map(
         (d) => `<div class="device">
-          <div>
+          <div class="grow">
             <div>${esc(d.name)}${d.revokedAt ? ' (revoked)' : ''}</div>
             <div class="sub">${esc(d.id)} · ${d.lastSeenAt ? `seen ${ago(d.lastSeenAt)}` : 'never seen'}</div>
           </div>
-          ${d.revokedAt ? '' : `<button class="btn btn-danger btn-sm" data-revoke="${d.id}">Revoke</button>`}
+          ${d.revokedAt ? '' : `<button class="btn btn-danger btn-sm" data-revoke="${esc(d.id)}">Revoke</button>`}
         </div>`,
       )
       .join('') || '<p class="hint">No paired devices.</p>';
@@ -716,7 +916,7 @@ $('#new-pair').onclick = async () => {
   $('#pair-code').title = `expires ${new Date(expiresAt).toLocaleTimeString()}`;
 };
 
-// ------------------------------------------------------------------ push
+// -------------------------------------------------------------------- push
 
 async function refreshPushState() {
   const el = $('#push-state');
@@ -773,9 +973,35 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => undefined);
 }
 
-// Deep link from a notification: /?tab=inbox or /?confirm=c-xxxx
-const params = new URLSearchParams(location.search);
-if (params.get('tab') || params.get('confirm')) {
-  const target = params.get('confirm') ? 'inbox' : params.get('tab');
-  document.querySelector(`nav button[data-tab="${target}"]`)?.click();
+// -------------------------------------------------------------------- init
+
+async function init() {
+  const [{ projects }, { agents }] = await Promise.all([api('/api/projects'), api('/api/agents')]);
+  state.projects = projects;
+  state.agents = agents;
+
+  const options = (first) =>
+    first + projects.map((p) => `<option value="${esc(p.name)}">${esc(projectLabel(p))}</option>`).join('');
+  $('#project').innerHTML = options('<option value="">No project (scratch)</option>');
+  $('#filter-project').innerHTML = options('<option value="">Any project</option>');
+  $('#runs-project').innerHTML = options('<option value="*">All projects</option>') + '<option value="">No project</option>';
+  $('#runs-project').onchange = (e) => selectProject(e.target.value === '*' ? null : e.target.value);
+  $('#agent').innerHTML = `<option value="">Default agent</option>` + agents.map((a) => `<option value="${esc(a.name)}">${esc(a.name)}</option>`).join('');
+
+  renderProjects();
+  renderComposer();
+  renderDetail();
+  await refreshStatus();
+  await refreshRuns();
+  connect();
+  setInterval(refreshStatus, 15_000);
+
+  // Deep link from a notification: /?tab=inbox or /?confirm=c-xxxx
+  const params = new URLSearchParams(location.search);
+  if (params.get('tab') || params.get('confirm')) showView(params.get('confirm') ? 'inbox' : params.get('tab'));
 }
+
+init().catch((err) => {
+  $('#health').className = 'healthline halted';
+  $('#health').innerHTML = `<span class="dot"></span><span>${esc(err.message)}</span>`;
+});

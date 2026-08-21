@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { LoadedConfig } from '../config/load.js';
 import { findProject, profileFor, expandPath } from '../config/load.js';
+import { projectLabel } from '../config/schema.js';
 import type { AgentConfig, TaskClass } from '../config/schema.js';
 import { ClaudeProcess, type ClaudeEvent } from './claude.js';
 import { GitWrapper, isRepo, formatDiffStat } from './git.js';
@@ -181,7 +182,7 @@ export class RunRegistry extends EventEmitter {
       runId: id,
       kind: 'run.queued',
       source: 'runner',
-      summary: `${id} queued${project ? ` in ${project.name}` : ''}${agent ? ` as ${agent.name}` : ''}: ${truncate(input.prompt, 120)}`,
+      summary: `${id} queued${project ? ` in ${projectLabel(project)}` : ''}${agent ? ` as ${agent.name}` : ''}: ${truncate(input.prompt, 120)}`,
       data: { project: project?.name, agent: agent?.name, taskClass, intent: record.intent, channel: record.channel },
     });
 
@@ -420,7 +421,7 @@ export class RunRegistry extends EventEmitter {
       runId: record.id,
       kind: 'run.started',
       source: 'runner',
-      summary: `${record.id} started${record.project ? ` in ${record.project}` : ''}`,
+      summary: `${record.id} started${project ? ` in ${projectLabel(project)}` : ''}`,
       data: {
         workdir,
         caps,
